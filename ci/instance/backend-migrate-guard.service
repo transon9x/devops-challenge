@@ -1,0 +1,8 @@
+[Unit]
+Description=Power off this migration job host
+# Launch templates set InstanceInitiatedShutdownBehavior=terminate, so powering off
+# terminates the instance.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --no-block poweroff

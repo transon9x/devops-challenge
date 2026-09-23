@@ -1,0 +1,9 @@
+# Review ownership. The migration directories matter most: `check-migrations.sh` is a
+# guardrail, and the expand-only contract is upheld here.
+*                                   @platform-team
+/.github/workflows/                 @platform-team @security-team
+/ci/                                @platform-team
+/ci/infra/                          @platform-team @security-team
+/ci/policy/                         @security-team
+/src/problem4/backend/migrations/   @platform-team @dba-team
+/src/problem4/frontend/migrations/  @platform-team @dba-team

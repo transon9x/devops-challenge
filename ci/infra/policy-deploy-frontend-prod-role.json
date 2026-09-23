@@ -1,0 +1,87 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PullTheReleaseAndItsReferrers",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:<REGION>:<AWS_ACCOUNT_ID>:repository/<APP>"
+    },
+    {
+      "Sid": "RegistryToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadPromotionMarkers",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::<PROMOTION_BUCKET>/promotions/frontend/*"
+    },
+    {
+      "Sid": "TellMissingFromDenied",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<PROMOTION_BUCKET>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "promotions/frontend/*"
+        }
+      }
+    },
+    {
+      "Sid": "ProdCannotWriteItsOwnProvenance",
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<PROMOTION_BUCKET>/*"
+    },
+    {
+      "Sid": "NobodyDeletes",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "ecr:BatchDeleteImage"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WriteOnlyTheLivePaths",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<SITE_BUCKET_PROD>/index.html",
+        "arn:aws:s3:::<SITE_BUCKET_PROD>/config.json",
+        "arn:aws:s3:::<SITE_BUCKET_PROD>/assets/*"
+      ]
+    },
+    {
+      "Sid": "SeeTheSiteBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<SITE_BUCKET_PROD>"
+    },
+    {
+      "Sid": "InvalidateOneDistribution",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreateInvalidation",
+        "cloudfront:GetInvalidation"
+      ],
+      "Resource": "arn:aws:cloudfront::<AWS_ACCOUNT_ID>:distribution/<DISTRIBUTION_ID_PROD>"
+    }
+  ]
+}

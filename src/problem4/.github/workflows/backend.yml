@@ -1,0 +1,51 @@
+---
+name: backend
+
+# The whole file an application repository needs: triggers, inputs, one call.
+# Stages live in the shared pipeline, pinned to a commit (the comment is the version).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Redeploy an already published release (full commit SHA). Empty = build HEAD.
+        type: string
+        default: ''
+      target_environment:
+        description: Where to deploy
+        type: choice
+        default: dev
+        options:
+          - dev
+          - prod
+      dry_run:
+        description: Print the exact operations and deploy nothing
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  pipeline:
+    permissions:
+      contents: read  # checkout
+      packages: write  # push the artifact, its signature and attestations to the registry
+      id-token: write  # OIDC: keyless signing and the AWS deploy roles
+      attestations: write  # GitHub build-provenance and SBOM attestations
+    uses: example-org/ci-templates/.github/workflows/pipeline.yml@0123456789abcdef0123456789abcdef01234567  # v1.4.0
+    with:
+      artifact_kind: image
+      registry: ecr
+      image_name: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/backend
+      aws_region: ap-southeast-1
+      ecr_publish_role_arn: arn:aws:iam::123456789012:role/gha-backend-publish
+      coverage_min: '85'
+      sonar_project_key: backend
+      release_sha: ${{ inputs.release_sha || '' }}
+      target_environment: ${{ inputs.target_environment || '' }}
+      dry_run: ${{ inputs.dry_run || false }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

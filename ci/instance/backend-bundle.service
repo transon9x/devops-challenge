@@ -1,0 +1,48 @@
+[Unit]
+Description=Backend HTTP API from the verified release bundle (no container runtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The release directory is replaced atomically by the bootstrap, which then restarts this
+# unit. Without a container the sandbox comes from systemd instead of docker flags.
+EnvironmentFile=/run/backend/env
+WorkingDirectory=/opt/backend/current
+ExecStart=/usr/bin/node src/server.js
+User=backend
+Group=backend
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/opt/backend
+RuntimeDirectory=backend-app
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

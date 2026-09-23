@@ -1,0 +1,20 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal stand-in for the team's HTTP API, so the pipeline runs for real.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --experimental-test-coverage --test-coverage-lines=80 --test-coverage-exclude='test/**' 'test/**/*.test.js'",
+    "lint": "eslint ."
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "eslint": "^9.39.0",
+    "globals": "^16.4.0"
+  }
+}

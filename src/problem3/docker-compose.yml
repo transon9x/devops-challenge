@@ -1,0 +1,107 @@
+---
+name: problem3
+
+services:
+  nginx:
+    image: nginx:1.31.6-alpine@sha256:d10753d9289b8e3f884386351f73554ce72b631378949deddd75e83ee296c427
+    ports:
+      # Bound to loopback: this stack is for local debugging only.
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+
+  api:
+    build: ./api
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-appdb}
+      DB_USER: ${APP_DB_USER:-app}
+      DB_PASSWORD: ${APP_DB_PASSWORD:-local_dev_only_change_me_too}
+      DB_POOL_MAX: ${DB_POOL_MAX:-8}
+      # Empty means "use the default", which is twice the pool size.
+      MAX_INFLIGHT: ${MAX_INFLIGHT:-}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 0 unless verify.sh is proving graceful shutdown.
+      DRAIN_TEST_DELAY_MS: ${DRAIN_TEST_DELAY_MS:-0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Only started, not healthy: the cache is optional at runtime, so gating startup on it
+      # would contradict that and keep the API down for an outage it is built to survive.
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 256M
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_only_change_me}
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-local_dev_only_change_me_too}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./postgres/20-app-user.sh:/docker-entrypoint-initdb.d/20-app-user.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      # Over TCP, not the socket: during initdb the entrypoint's temporary server listens on
+      # the socket only, so a socket check reports healthy before the real server exists.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 96M
+
+volumes:
+  postgres-data:

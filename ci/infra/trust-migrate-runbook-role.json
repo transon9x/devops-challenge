@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlySystemsManagerAutomationAssumesThis",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ssm.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "<AWS_ACCOUNT_ID>"
+        },
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:ssm:<REGION>:<AWS_ACCOUNT_ID>:automation-execution/*"
+        }
+      }
+    }
+  ]
+}

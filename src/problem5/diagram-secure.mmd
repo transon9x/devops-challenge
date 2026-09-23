@@ -1,0 +1,107 @@
+flowchart TB
+    subgraph legend["Legend"]
+        l1["🔴 design changed from Problem 1"]
+        l2["🟠 control added and implementable today"]
+        l4["🟡 required before launch, NOT yet built"]
+        l5["grey: already in Problem 1, unchanged"]
+        l3["⚪ risk accepted for now"]
+    end
+
+    subgraph internet["Internet"]
+        users["Customers"]
+        attacker["Attacker: ATO · API abuse · DDoS · phishing of staff · poisoned build"]
+    end
+
+    subgraph edgeacct["Edge — the only public surface"]
+        shield["Shield Advanced on CloudFront + Route 53,<br/>automatic layer-7 mitigation (Problem 1)"]
+        waf["WAF on CloudFront (Problem 1)<br/>🟠 body inspection capped at 16 KB: oversize = block"]
+        cf["CloudFront — the only public surface (Problem 1)<br/>🟠 HSTS · strict CSP"]
+    end
+
+    subgraph orgacct["AWS Organization — 🔴 multi-account, SCP-guarded (keyless already in Problem 1)"]
+        subgraph trading["Account: prod-trading"]
+            spa[("S3 — SPA bundle (Problem 1)<br/>private, origin access control only")]
+            alb["internal ALB — VPC origin (Problem 1)<br/>admits only CloudFront's service security group"]
+            subgraph eks["EKS trading-prod — Pod Identity (Problem 1)<br/>🟠 private API endpoint · Pod Security Standards restricted"]
+                kong["Kong Gateway OSS (REST) — Problem 1<br/>own namespace + node pool · Admin API ClusterIP-only<br/>🟠 no AWS permission beyond the quota cache"]
+                ns["namespaces per team (Problem 1)<br/>🟠 NetworkPolicy default-deny · access entries per namespace"]
+                mesvc["matching-svc + outbox-relay<br/>dedicated node pool · 🟠 own pod security group"]
+                kyv["🟡 Kyverno: verify signature + provenance<br/>deny privileged · hostPath · mutable tags · any other registry"]
+            end
+            subgraph datatier["🔴 Private data subnets — no internet route<br/>🟠 admit pod security groups only, never the node group"]
+                aurora[("Aurora — IAM auth (Problem 1)<br/>🟠 KMS CMK · per-service roles · append-only ledger<br/>🟡 Database Activity Streams")]
+                valkey[("Valkey — IAM auth · TLS (Problem 1)<br/>🟠 per-user access strings")]
+                msk["MSK — IAM auth · TLS (Problem 1)<br/>🟠 per-service kafka-cluster IAM policies on topic, group + transactional-id ARNs"]
+            end
+            vpce["🟠 VPC endpoints for AWS APIs<br/>no NAT for the data plane"]
+            subgraph obs["EKS obs-prod"]
+                tenants["one telemetry tenant per team · Grafana org per team (Problem 1)<br/>🟠 PII scrubbed before export"]
+            end
+        end
+
+        subgraph custody["🔴 Account: prod-custody — new blast-radius boundary<br/>🟠 PrivateLink ingress with workload authentication · FQDN-allowlisted egress proxy"]
+            policy["🔴 withdrawal-policy-engine — crypto AND fiat payouts<br/>limits · allowlist + 24h delay · velocity · quorum<br/>four separated roles · idempotent · nonce replay guard"]
+            chain["🟠 2+ independent chain observers<br/>deposit confirmation, reorg detection"]
+            secrets["🟠 Secrets Manager: custodian + PSP credentials, rotated"]
+        end
+
+        subgraph secacct["🟠 Account: security + log archive"]
+            trail["🟠 CloudTrail org trail (digest validation, 7 y)<br/>+ EKS audit logs via a delivery stream (1 y)<br/>→ S3 Object Lock compliance mode, KMS key held elsewhere"]
+            gd["GuardDuty (EKS protection, runtime monitoring)<br/>Security Hub · Config · Inspector"]
+            siem["Security alerts → PagerDuty security service<br/>IR runbooks rehearsed"]
+        end
+    end
+
+    subgraph ext["External, outside our trust boundary"]
+        custodian["🔴 Licensed custodian<br/>holds 100% of signing keys/shares; we hold an API credential only"]
+        psp["🔴 PSP with tokenisation<br/>card data never enters the platform"]
+        approvers["🟠 Named approvers<br/>hardware keys + independent transaction display"]
+        aml["🟠 Sanctions screening · blockchain analytics · value-transfer data"]
+    end
+
+    subgraph cicd["Delivery (Problem 4)"]
+        gh["🟠 Shared GitHub workflow templates — OIDC only, SHA-pinned<br/>quality gate · SBOM · keyless signature + provenance"]
+        reg["🟠 private registry, deploy by digest only"]
+    end
+
+    users --> shield --> waf --> cf
+    cf -- "origin access control" --> spa
+    cf -- "VPC origin" --> alb
+    alb -- "REST + webhooks" --> kong --> ns
+    alb -- "WebSocket" --> ns
+    attacker -. "blocked / rate-limited" .-> waf
+    attacker -. "unsigned image rejected" .-> kyv
+    ns -- "pod SG → store SG" --> aurora
+    mesvc -- "pod SG → store SG" --> aurora
+    ns --> valkey
+    mesvc --> msk
+    ns --> vpce
+    ns -- "withdrawal / payout intent only" --> policy
+    policy --> aml
+    policy -- "authenticated request, policy enforced on both sides" --> custodian
+    policy -- "payout instruction" --> psp
+    psp -- "signed webhooks, IP allowlist" --> cf
+    approvers -- "verify on an independent channel, then approve" --> policy
+    custodian -. "attestations + balances, daily" .-> policy
+    chain --> policy
+    policy --> secrets
+    eks -.-> tenants
+    trading -.-> trail
+    custody -.-> trail
+    trail --> siem
+    gd --> siem
+    gh --> reg --> kyv
+
+    accepted["⚪ Accepted for now: no service-to-service mTLS at launch (NetworkPolicy default-deny + Pod Identity + TLS to every store)<br/>⚪ Accepted for now: single active region with warm standby DR<br/>⚪ Deferred: SOC 2 / ISO audit (controls first, certification after)"]
+
+    classDef changed fill:#fecaca,stroke:#b91c1c,stroke-width:3px,color:#1f2937
+    classDef added fill:#fed7aa,stroke:#c2410c,stroke-width:2px,color:#1f2937
+    classDef planned fill:#fef08a,stroke:#a16207,stroke-dasharray:4 2,color:#1f2937
+    classDef accept fill:#f3f4f6,stroke:#6b7280,stroke-dasharray:5 3,color:#1f2937
+    class policy,custodian,psp,l1 changed
+    class waf,gd,trail,siem,secrets,chain,approvers,aml,gh,reg,vpce,l2 added
+    classDef inherited fill:#e5e7eb,stroke:#4b5563,color:#1f2937
+    class shield,cf,alb,spa,kong,ns,tenants inherited
+    class kyv,l4 planned
+    class accepted,l3 accept
+    class l5 inherited

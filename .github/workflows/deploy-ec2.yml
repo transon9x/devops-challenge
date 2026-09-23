@@ -1,0 +1,127 @@
+---
+name: deploy-ec2
+
+# Immutable rollout of a verified backend image (by digest) to one environment's Auto
+# Scaling group, through the version-pinned Automation runbook. The runner holds no EC2
+# or Auto Scaling write permission; the runbook's role does. No SSH anywhere.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev or prod
+        type: string
+        required: true
+      artifact:
+        description: Image repository without a tag
+        type: string
+        required: true
+      digest:
+        description: Image digest; empty means resolve it from the sha-<release_sha> tag
+        type: string
+        default: ''
+      release_sha:
+        type: string
+        required: true
+      registry:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  TEMPLATE_DIR: .ci-templates
+
+jobs:
+  deploy:
+    name: Deploy backend to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.BACKEND_URL }}
+    # One lock per application and environment, shared with migrate-db.yml, so a schema
+    # change and a rollout can never overlap even when they come from different runs.
+    concurrency:
+      group: backend-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read  # checkout
+      packages: write  # promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's deploy role
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      ARTIFACT: ${{ inputs.artifact }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Validate inputs
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ENVIRONMENT" =~ ^(dev|prod)$ ]] || { echo "::error::environment must be dev or prod"; exit 1; }
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::release_sha must be a full commit SHA"; exit 1; }
+          [[ -z "$DIGEST" || "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest is malformed"; exit 1; }
+      - name: Check out this template revision (not the caller's repository)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ${{ env.TEMPLATE_DIR }}
+          persist-credentials: false
+      - name: Install pinned tools
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for tool in cosign oras; do
+            bash "${TEMPLATE_DIR}/ci/scripts/install-tool.sh" "$tool"
+          done
+      - name: Log in to GitHub Container Registry
+        if: ${{ !inputs.dry_run && inputs.registry == 'ghcr' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Assume the ${{ inputs.environment }} deploy role (OIDC, no static keys)
+        if: ${{ !inputs.dry_run }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-backend-${{ inputs.environment }}-${{ github.run_id }}
+          audience: sts.amazonaws.com
+      - name: Log in to Amazon ECR
+        if: ${{ !inputs.dry_run && inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
+      - name: Resolve the digest from the release tag when none was passed
+        id: digest
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" && "$DRY_RUN" != "true" ]]; then
+            DIGEST="$(oras manifest fetch --descriptor "${ARTIFACT}:sha-${RELEASE_SHA}" | jq -r .digest)"
+          fi
+          [[ "$DRY_RUN" == "true" || "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no release published for ${RELEASE_SHA}"; exit 1; }
+          echo "digest=${DIGEST:-sha256:$(printf '0%.0s' $(seq 1 64))}" >> "$GITHUB_OUTPUT"
+      - name: Deploy
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PROMOTION_BUCKET: ${{ vars.PROMOTION_BUCKET }}
+          SSM_DOCUMENT_ARN: ${{ vars.SSM_DEPLOY_DOCUMENT_ARN }}
+          SSM_DOCUMENT_VERSION: ${{ vars.SSM_DEPLOY_DOCUMENT_VERSION }}
+          AUTOMATION_ROLE_ARN: ${{ vars.SSM_AUTOMATION_ROLE_ARN }}
+          ASG_NAME: ${{ vars.BACKEND_ASG_NAME }}
+          LAUNCH_TEMPLATE_ID: ${{ vars.BACKEND_LAUNCH_TEMPLATE_ID }}
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          ALARM_NAMES: ${{ vars.BACKEND_ROLLBACK_ALARMS }}
+          CHECKPOINTS: ${{ vars.BACKEND_REFRESH_CHECKPOINTS }}
+          TEMPLATE_REPO: ${{ job.workflow_repository }}
+          TEMPLATE_SHA: ${{ job.workflow_sha }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_REF: refs/heads/main
+          GH_TOKEN: ${{ github.token }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/deploy-ec2.sh"

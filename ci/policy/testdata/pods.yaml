@@ -1,0 +1,54 @@
+---
+# Sample pods for ci/policy/test-admission.sh: three that must be rejected
+# (mutable tag, a registry that is not ours, a vendor image outside the allowlist) and two
+# that must be admitted (our registry by digest, an approved vendor image in an add-on
+# namespace).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: good-app
+  namespace: team-trading
+spec:
+  containers:
+    - name: app
+      image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/backend@sha256:1111111111111111111111111111111111111111111111111111111111111111
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mutable-tag
+  namespace: team-trading
+spec:
+  containers:
+    - name: app
+      image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/backend:latest
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: foreign-registry
+  namespace: team-trading
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx@sha256:1111111111111111111111111111111111111111111111111111111111111111
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vendor-in-platform
+  namespace: kube-system
+spec:
+  containers:
+    - name: addon
+      image: registry.k8s.io/pause@sha256:1111111111111111111111111111111111111111111111111111111111111111
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: random-in-platform
+  namespace: kube-system
+spec:
+  containers:
+    - name: addon
+      image: docker.io/evil/thing@sha256:1111111111111111111111111111111111111111111111111111111111111111

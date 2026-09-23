@@ -1,0 +1,25 @@
+[Unit]
+Description=Backend HTTP API container
+After=docker.service
+Requires=docker.service
+
+[Service]
+EnvironmentFile=/run/backend/image
+ExecStartPre=-/usr/bin/docker rm -f backend
+ExecStart=/usr/bin/docker run --rm --name backend \
+  --pull=never \
+  --user 10001:10001 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --memory 512m --cpus 1 --pids-limit 256 \
+  --env-file /run/backend/env \
+  --publish 3000:3000 \
+  --log-driver journald \
+  ${IMAGE_REF}
+ExecStop=/usr/bin/docker stop -t 20 backend
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

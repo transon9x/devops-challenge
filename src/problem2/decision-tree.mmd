@@ -1,0 +1,65 @@
+flowchart TD
+    start(["Alert: filesystem 99% full on the NGINX LB"]) --> which
+
+    which["Identify the filesystem from the alert<br/>findmnt --target · df -hT · df -i<br/>never assume /"]
+    which --> triage
+
+    triage["Phase 0 — triage, 5 min<br/>systemctl status nginx · bounded curl on the real listener<br/>upstream 5xx rate · dmesg (no nginx -t: it can create files)"]
+    triage --> serving{"Is NGINX still<br/>serving traffic?"}
+
+    serving -- "no" --> incident["Declare an incident<br/>drain or fail over this LB first,<br/>then diagnose"]
+    serving -- "yes" --> preserve["PRESERVE EVIDENCE FIRST (Phase 0b)<br/>access + error log · /etc config · journal<br/>the deleted inode via /proc/pid/fd<br/>stream off-box with pipefail, then verify checksums"]
+    incident --> preserve
+
+    preserve --> rofs{"Read-only or erroring<br/>filesystem?<br/>dmesg · mount options"}
+    rofs -- "yes" --> fault["Storage or filesystem FAULT, not capacity<br/>do NOT remount rw, do NOT fsck while mounted<br/>do NOT delete, compress or truncate: this branch never writes<br/>drain · keep dmesg + device logs · snapshot"]
+    fault --> faultfix["Repair unmounted — rescue media or the volume attached elsewhere —<br/>or replace the instance from an image"]
+    faultfix --> faultverify(["Verify: mount options read-write again, no dmesg errors,<br/>upstream 5xx and latency at baseline"])
+
+    rofs -- "no" --> inodes{"df -i<br/>inodes exhausted?"}
+    inodes -- "yes" --> manysmall["Millions of small files<br/>delete in bounded batches,<br/>then fix what produces them"]
+
+    inodes -- "no" --> gap{"Does du disagree<br/>with df?"}
+
+    gap -- "yes: du much smaller" --> deleted{"lsof +L1 shows<br/>deleted-but-open files?<br/>key by device+inode"}
+    deleted -- "yes" --> reopen["#2 CAUSE — deleted log still open<br/>copy the descriptor off-box FIRST<br/>then nginx -s reopen (USR1)"]
+    deleted -- "no" --> hidden["Hidden under a mount point, or reserved blocks<br/>mount --bind $MOUNT /mnt/fscheck<br/>tune2fs -l | grep reserved"]
+
+    gap -- "no: du agrees" --> where["du -xh --max-depth=1 on the alerted mount<br/>then drill down<br/>(nice + ionice, bounded)"]
+
+    where --> ngxlogs{"Is it<br/>/var/log/nginx?"}
+    ngxlogs -- "yes" --> logcause["#1 CAUSE — unbounded access/error log<br/>log_format · error_log level · health checks<br/>logrotate state · traffic anomaly as a trigger"]
+    ngxlogs -- "no" --> other{"Where is it?"}
+
+    other -- "/var/log/journal" --> journal["Journal over its cap, often duplicating nginx<br/>journalctl --disk-usage<br/>SystemMaxUse / SystemKeepFree"]
+    other -- "/var/log/*.log" --> oslogs["OS logs or a shipper spool<br/>rotation failing silently<br/>logrotate -d /etc/logrotate.conf"]
+    other -- "/var/lib/nginx" --> temp["proxy_temp / client_body_temp<br/>cap proxy_max_temp_file_size<br/>and client_max_body_size"]
+    other -- "proxy cache dir" --> cache["proxy_cache_path with no max_size<br/>set max_size + inactive, then reload<br/>never delete cache files by hand"]
+    other -- "coredump / crash" --> crash["Core dumps: keep one, cap with MaxUse=<br/>the crash is the real finding"]
+    other -- "apt / snap / kernels" --> pkg["Package cache, old kernels,<br/>disabled snap revisions"]
+    other -- "one stray big file" --> stray["Ad-hoc dump or capture<br/>move to object storage"]
+    other -- "nothing obvious" --> sizing["#3 CAUSE — the filesystem is<br/>smaller than the 64 GB disk<br/>lsblk · vgs · growpart + resize2fs/xfs_growfs"]
+
+    reopen --> recover
+    logcause --> recover
+    journal --> recover
+    oslogs --> recover
+    temp --> recover
+    cache --> recover
+    crash --> recover
+    pkg --> recover
+    stray --> recover
+    sizing --> recover
+    manysmall --> recover
+    hidden --> recover
+
+    recover["Phase 3 — recover in this order:<br/>1. evidence verified off-box<br/>2. reopen descriptors<br/>3. grow the filesystem if capacity is unused<br/>4. remove verified disposable data<br/>5. compress/rotate only with headroom<br/>6. truncate last (data is lost)<br/>7. verify df + 5xx + latency, do NOT reload"]
+    recover --> prevent["Prevent: ship logs off-box · sample · exclude health checks ·<br/>logrotate with postrotate reopen · cap journald, cache, temp, coredumps ·<br/>separate /var/log volume · alert at 80% + predict_linear + inodes + log bytes/s"]
+
+    classDef top fill:#fecaca,stroke:#b91c1c,stroke-width:2px,color:#1f2937
+    classDef safe fill:#dcfce7,stroke:#15803d,color:#1f2937
+    classDef action fill:#fef3c7,stroke:#b45309,color:#1f2937
+    class logcause,reopen,sizing top
+    class preserve,recover,prevent safe
+    class which,triage,where action
+    class fault,faultfix top

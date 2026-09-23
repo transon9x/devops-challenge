@@ -1,0 +1,122 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: only-images-built-by-the-shared-pipeline
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: no-mutable-tags
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: images must be referenced by digest
+        foreach:
+          - list: request.object.spec.[containers, initContainers, ephemeralContainers][]
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: NotEquals
+                    value: "*@sha256:*"
+    - name: only-the-private-registry
+      # Without this rule the verifyImages rule below is decorative: it only matches the
+      # private registry, so a digest-pinned image from any public registry would pass.
+      # Application namespaces may use nothing but the private registry.
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              # Cluster add-ons come from vendor registries; the next rule bounds which
+              # ones, and no namespace is exempt from the digest rule above.
+              namespaces: [kube-system, kyverno, karpenter, platform]
+      validate:
+        message: >-
+          images must come from the organisation's private registry; only the excluded
+          platform namespaces may run vendor images
+        foreach:
+          - list: request.object.spec.[containers, initContainers, ephemeralContainers][]
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: NotEquals
+                    value: "<AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/*"
+    - name: platform-namespaces-use-approved-vendor-registries
+      # The add-on namespaces are not a hole: they may run vendor images, from these
+      # registries only, and still only by digest.
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [kube-system, kyverno, karpenter, platform]
+      validate:
+        message: >-
+          platform namespaces may run images only from the private registry or an approved
+          vendor registry
+        foreach:
+          - list: request.object.spec.[containers, initContainers, ephemeralContainers][]
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.image }}"
+                    operator: AnyNotIn
+                    value:
+                      - "<AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/*"
+                      - "public.ecr.aws/eks-distro/*"
+                      - "public.ecr.aws/karpenter/*"
+                      - "registry.k8s.io/*"
+                      - "ghcr.io/kyverno/*"
+                      - "quay.io/prometheus/*"
+    - name: signed-and-attested-by-the-pinned-template
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences:
+            - "<AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          failureAction: Enforce
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/<ORG>/ci-templates/.github/workflows/build-publish.yml@<TEMPLATE_SHA>"
+                    issuer: https://token.actions.githubusercontent.com
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                    additionalExtensions:
+                      githubWorkflowRepository: "<ORG>/<APP_REPO>"
+                      githubWorkflowRef: refs/heads/main
+          attestations:
+            - type: https://slsa.dev/provenance/v1
+              attestors:
+                - entries:
+                    - keyless:
+                        subject: "https://github.com/<ORG>/ci-templates/.github/workflows/build-publish.yml@<TEMPLATE_SHA>"
+                        issuer: https://token.actions.githubusercontent.com
+              conditions:
+                - all:
+                    - key: "{{ buildDefinition.externalParameters.workflow.repository }}"
+                      operator: Equals
+                      value: "https://github.com/<ORG>/<APP_REPO>"
+                    - key: "{{ buildDefinition.externalParameters.workflow.ref }}"
+                      operator: Equals
+                      value: refs/heads/main
+            - type: https://cyclonedx.org/bom
+              attestors:
+                - entries:
+                    - keyless:
+                        subject: "https://github.com/<ORG>/ci-templates/.github/workflows/build-publish.yml@<TEMPLATE_SHA>"
+                        issuer: https://token.actions.githubusercontent.com

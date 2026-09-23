@@ -1,0 +1,209 @@
+---
+name: ci
+
+# This repository's own CI: on every pull request and push to main it lints everything,
+# runs the Problem 3 fault-injection suite, and runs the shared Problem 4 pipeline for real
+# against both applications (quality gate, build, scan; on main publish + sign + attest to
+# GHCR). The deploy stages are disabled here because there is no AWS account behind it.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflows:
+    name: Lint workflows (templates and callers)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint (pinned release, checksum verified)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          ACTIONLINT="$PWD/actionlint" ci/scripts/lint-workflows.sh
+      - name: zizmor (pedantic) on the shared templates
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482  # v0.6.4
+        with:
+          version: 1.30.1
+          persona: pedantic
+          advanced-security: false
+          inputs: .github/workflows/
+      - name: zizmor (pedantic, offline) on the caller workflows
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482  # v0.6.4
+        with:
+          version: 1.30.1
+          persona: pedantic
+          advanced-security: false
+          online-audits: false
+          inputs: src/problem4/.github/workflows/
+
+  scripts:
+    name: Lint shell, YAML and the runbook; unit-test the Python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck (pinned release, checksum verified)
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          tarball="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${tarball}"
+          echo "${SHELLCHECK_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xJf "$tarball"
+          "./shellcheck-v${SHELLCHECK_VERSION}/shellcheck" -x \
+            ci/scripts/*.sh ci/instance/*.sh \
+            src/problem2/*.sh src/problem3/verify.sh src/problem3/postgres/*.sh
+      - name: The migration SQL contract, against a real PostgreSQL
+        run: ci/scripts/test-migration-sql.sh
+      - name: The admission policy admits and rejects what the documents claim
+        run: ci/policy/test-admission.sh
+      - name: The systemd units the AMI installs are valid
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/ci/instance":/u:ro ubuntu:24.04 bash -c '
+            apt-get -qq update >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get -qq install -y systemd >/dev/null 2>&1
+            install -d /opt/backend /opt/backend/current /run/backend
+            for f in /opt/backend/bootstrap.sh /opt/backend/migrate.sh /usr/bin/node /usr/bin/docker; do
+              printf "#!/bin/sh\nexit 0\n" > "$f"; chmod +x "$f"
+            done
+            : > /run/backend/env
+            useradd -r backend 2>/dev/null; useradd -r migrator 2>/dev/null
+            cp /u/*.service /u/*.timer /etc/systemd/system/
+            printf "[Unit]\nDescription=stub\n[Service]\nExecStart=/bin/true\n" > /etc/systemd/system/docker.service
+            fail=0
+            for f in /u/*.service /u/*.timer; do
+              n=$(basename "$f")
+              out=$(systemd-analyze verify "/etc/systemd/system/$n" 2>&1 || true)
+              if [ -z "$out" ]; then echo "OK   $n"; else echo "FAIL $n"; echo "$out"; fail=1; fi
+            done
+            exit $fail'
+      - name: The deploy and migrate scripts in dry-run mode make no AWS call
+        env:
+          DRY_RUN: 'true'
+          DIGEST: sha256:1111111111111111111111111111111111111111111111111111111111111111
+          RELEASE_SHA: '1111111111111111111111111111111111111111'
+          PROMOTION_BUCKET: example-promotions
+          TEMPLATE_REPO: example-org/ci-templates
+          TEMPLATE_SHA: '1111111111111111111111111111111111111111'
+          SOURCE_REPO: example-org/backend
+          SOURCE_REF: refs/heads/main
+          SSM_DOCUMENT_ARN: arn:aws:ssm:ap-southeast-1:111122223333:document/deploy
+          SSM_DOCUMENT_VERSION: '3'
+          AUTOMATION_ROLE_ARN: arn:aws:iam::111122223333:role/runbook
+        run: |
+          set -euo pipefail
+          ARTIFACT=ghcr.io/example/backend ENVIRONMENT=dev ASG_NAME=asg \
+            LAUNCH_TEMPLATE_ID=lt-0123456789abcdef0 BACKEND_URL=https://api.example.com \
+            ci/scripts/deploy-ec2.sh
+          ARTIFACT=ghcr.io/example/frontend ENVIRONMENT=dev SITE_BUCKET=site \
+            DISTRIBUTION_ID=E123 SITE_URL=https://app.example.com \
+            ci/scripts/deploy-s3.sh
+          ARTIFACT=ghcr.io/example/backend ENVIRONMENT=prod \
+            MIGRATION_LAUNCH_TEMPLATE_ID=lt-0123456789abcdef0 \
+            MIGRATION_LAUNCH_TEMPLATE_VERSION='4' DB_CLUSTER_IDENTIFIER=trading-prod \
+            RESULT_PARAMETER_PREFIX=/app/backend/prod/migrations \
+            ci/scripts/migrate-db.sh
+      - name: yamllint
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --user 'yamllint==1.38.0'
+          python3 -m yamllint -c .yamllint.yml .
+      - name: Unit tests (scan-ignore translator, launch-template rules, bundle extractor)
+        working-directory: ci/scripts
+        run: python3 -m unittest -v test_scan_ignore test_launch_template test_extract_bundle test_sql_guard test_runbooks
+      - name: Every tool download is pinned by version and SHA-256
+        run: |
+          set -euo pipefail
+          grep -E '^[A-Z]+_VERSION=' ci/tools.env | cut -d= -f1 | sed 's/_VERSION$//' | while read -r tool; do
+            if [[ "$tool" == SEMGREP ]]; then
+              grep -qE '^SEMGREP_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' ci/tools.env || { echo "::error::semgrep image is not digest-pinned"; exit 1; }
+              grep -qE '^SEMGREP_RULES_SHA=[0-9a-f]{40}$' ci/tools.env || { echo "::error::semgrep rules are not commit-pinned"; exit 1; }
+              continue
+            fi
+            grep -qE "^${tool}_SHA256=[0-9a-f]{64}$" ci/tools.env || { echo "::error::${tool} has no SHA-256 pin"; exit 1; }
+          done
+
+  backend:
+    name: Problem 4 pipeline (backend image)
+    permissions:
+      contents: read  # checkout
+      packages: write  # push artifact, signature and attestations
+      id-token: write  # keyless signing and OIDC to AWS
+      attestations: write  # GitHub provenance and SBOM attestations
+    uses: $/.github/workflows/pipeline.yml
+    with:
+      app_dir: src/problem4/backend
+      artifact_kind: image
+      registry: ghcr
+      image_name: ghcr.io/${{ github.repository }}/backend
+      deploy: false
+
+  backend-bundle:
+    name: Problem 4 pipeline (backend bundle, EC2 without a container)
+    permissions:
+      contents: read  # checkout
+      packages: write  # push artifact, signature and attestations
+      id-token: write  # keyless signing and OIDC to AWS
+      attestations: write  # GitHub provenance and SBOM attestations
+    uses: $/.github/workflows/pipeline.yml
+    with:
+      app_dir: src/problem4/backend
+      artifact_kind: bundle
+      registry: ghcr
+      image_name: ghcr.io/${{ github.repository }}/backend-bundle
+      deploy: false
+
+  frontend:
+    name: Problem 4 pipeline (frontend bundle)
+    permissions:
+      contents: read  # checkout
+      packages: write  # push artifact, signature and attestations
+      id-token: write  # keyless signing and OIDC to AWS
+      attestations: write  # GitHub provenance and SBOM attestations
+    uses: $/.github/workflows/pipeline.yml
+    with:
+      app_dir: src/problem4/frontend
+      artifact_kind: static
+      registry: ghcr
+      image_name: ghcr.io/${{ github.repository }}/frontend
+      deploy: false
+
+  problem3:
+    name: Verify the Problem 3 fixes end to end
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the fault-injection suite
+        working-directory: src/problem3
+        run: ./verify.sh

@@ -1,0 +1,61 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NobodyDeletesAPromotion",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:DeleteBucket",
+        "s3:PutLifecycleConfiguration"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<PROMOTION_BUCKET>",
+        "arn:aws:s3:::<PROMOTION_BUCKET>/*"
+      ]
+    },
+    {
+      "Sid": "VersioningStaysOn",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:PutBucketVersioning",
+        "s3:PutObjectLockConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::<PROMOTION_BUCKET>"
+    },
+    {
+      "Sid": "OnlyDevDeployRolesWriteMarkers",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<PROMOTION_BUCKET>/promotions/*",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::<AWS_ACCOUNT_ID>:role/gha-backend-deploy-dev",
+            "arn:aws:iam::<AWS_ACCOUNT_ID>:role/gha-frontend-deploy-dev",
+            "arn:aws:iam::<AWS_ACCOUNT_ID>:role/gha-migrate-dev"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "TlsOnly",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::<PROMOTION_BUCKET>",
+        "arn:aws:s3:::<PROMOTION_BUCKET>/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    }
+  ]
+}

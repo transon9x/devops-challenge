@@ -1,0 +1,66 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PullAndVerifyTheReleaseItMustApply",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:<REGION>:<AWS_ACCOUNT_ID>:repository/<APP>"
+    },
+    {
+      "Sid": "RegistryToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadTheDatabaseEndpointAndTheMigratorUserName",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParametersByPath",
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:<REGION>:<AWS_ACCOUNT_ID>:parameter/app/backend/<ENV>/config/db*"
+    },
+    {
+      "Sid": "PublishOnlyItsOwnOutcome",
+      "Effect": "Allow",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:<REGION>:<AWS_ACCOUNT_ID>:parameter<MIGRATION_RESULT_PARAMETER_PREFIX>/*"
+    },
+    {
+      "Sid": "ConnectAsTheMigratorUserOnly",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": "arn:aws:rds-db:<REGION>:<AWS_ACCOUNT_ID>:dbuser:<DB_RESOURCE_ID>/app_migrator"
+    },
+    {
+      "Sid": "JobLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:<REGION>:<AWS_ACCOUNT_ID>:log-group:/app/backend/<ENV>/migrate:*"
+    },
+    {
+      "Sid": "NotTheRuntimeUserAndNoOtherHostsBusiness",
+      "Effect": "Deny",
+      "Action": [
+        "rds:*",
+        "ec2:*",
+        "autoscaling:*",
+        "s3:*",
+        "secretsmanager:GetSecretValue",
+        "ssm:DeleteParameter",
+        "ssm:SendCommand"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

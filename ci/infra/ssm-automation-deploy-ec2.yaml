@@ -1,0 +1,411 @@
+---
+description: >-
+  Immutable rollout of one backend image digest: create a launch-template version that
+  differs from the stable one only in the digest tag, then run an Auto Scaling instance
+  refresh with automatic rollback. The GitHub runner may only start this document; every
+  EC2 and Auto Scaling write happens under the automation role.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+  Environment:
+    type: String
+    allowedValues: [dev, prod]
+  AutoScalingGroupName:
+    type: String
+    allowedPattern: '^[A-Za-z0-9._-]{1,255}$'
+  LaunchTemplateId:
+    type: String
+    allowedPattern: '^lt-[0-9a-f]{17}$'
+  ArtifactDigest:
+    type: String
+    allowedPattern: '^sha256:[0-9a-f]{64}$'
+  PromotionBucket:
+    type: String
+    default: ''
+    allowedPattern: '^([a-z0-9.-]{3,63})?$'
+  PromotionMarkerKey:
+    type: String
+    default: ''
+    allowedPattern: '^(promotions/backend/[0-9a-f]{64}\.dev-ok)?$'
+  AlarmNames:
+    type: StringList
+    default: []
+  MinHealthyPercentage:
+    type: Integer
+    default: 100
+  MaxHealthyPercentage:
+    type: Integer
+    default: 200
+  InstanceWarmupSeconds:
+    type: Integer
+    default: 120
+  BakeTimeSeconds:
+    type: Integer
+    default: 300
+  CheckpointPercentages:
+    type: StringList
+    default: []
+  CheckpointDelaySeconds:
+    type: Integer
+    default: 300
+  ReleaseDescription:
+    type: String
+    default: ''
+    allowedPattern: '^[A-Za-z0-9 :/._@-]{0,255}$'
+outputs:
+  - PrepareLaunchTemplateVersion.PreviousVersion
+  - PrepareLaunchTemplateVersion.NewVersion
+  - PrepareLaunchTemplateVersion.AlreadyCurrent
+  - StartInstanceRefresh.InstanceRefreshId
+  - ReadOutcome.Status
+  - ReadOutcome.StatusReason
+  - VerifyFleet.InstancesOnNewVersion
+mainSteps:
+  - name: ResolveStableVersion
+    action: aws:executeAwsApi
+    inputs:
+      Service: autoscaling
+      Api: DescribeAutoScalingGroups
+      AutoScalingGroupNames:
+        - '{{ AutoScalingGroupName }}'
+    outputs:
+      - Name: GroupLaunchTemplateId
+        Selector: '$.AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId'
+        Type: String
+      - Name: StableVersion
+        Selector: '$.AutoScalingGroups[0].LaunchTemplate.Version'
+        Type: String
+
+  - name: PrepareLaunchTemplateVersion
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Environment: '{{ Environment }}'
+        LaunchTemplateId: '{{ LaunchTemplateId }}'
+        GroupLaunchTemplateId: '{{ ResolveStableVersion.GroupLaunchTemplateId }}'
+        StableVersion: '{{ ResolveStableVersion.StableVersion }}'
+        ArtifactDigest: '{{ ArtifactDigest }}'
+        PromotionBucket: '{{ PromotionBucket }}'
+        PromotionMarkerKey: '{{ PromotionMarkerKey }}'
+        ReleaseDescription: '{{ ReleaseDescription }}'
+      Script: |
+        import copy
+        import json
+        import re
+
+        import boto3
+
+        DIGEST_TAG = "app:artifact-digest"
+        # Fleets built before the tag was renamed still carry the old key. Both are accepted so a
+        # deploy keeps working during the rename, and exactly one must be present so a template
+        # cannot carry two digests that disagree.
+        LEGACY_DIGEST_TAG = "app:image-digest"
+        DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+        def find_digest_tag(data: dict) -> tuple[int, int] | None:
+            found: list[tuple[int, int]] = []
+            for i, spec in enumerate(data.get("TagSpecifications", [])):
+                if spec.get("ResourceType") != "instance":
+                    continue
+                for j, tag in enumerate(spec.get("Tags", [])):
+                    if tag.get("Key") in (DIGEST_TAG, LEGACY_DIGEST_TAG):
+                        found.append((i, j))
+            if len(found) > 1:
+                raise ValueError(
+                    f"the launch template carries both {DIGEST_TAG!r} and {LEGACY_DIGEST_TAG!r}; "
+                    "leave exactly one"
+                )
+            return found[0] if found else None
+
+        def next_version_data(current: dict, digest: str) -> dict:
+            if not DIGEST.match(digest):
+                raise ValueError(f"not an image digest: {digest!r}")
+            where = find_digest_tag(current)
+            if where is None:
+                raise ValueError(
+                    f"the stable launch template has no instance tag {DIGEST_TAG!r} "
+                    f"(or the legacy {LEGACY_DIGEST_TAG!r})"
+                )
+            new = copy.deepcopy(current)
+            i, j = where
+            new["TagSpecifications"][i]["Tags"][j]["Value"] = digest
+            return new
+
+
+        def only_digest_changed(old: dict, new: dict) -> list[str]:
+            """Return the list of differences other than the digest tag value (empty means OK)."""
+            a, b = copy.deepcopy(old), copy.deepcopy(new)
+            wa, wb = find_digest_tag(a), find_digest_tag(b)
+            if wa is None or wb is None or wa != wb:
+                return ["digest tag missing or moved"]
+            a["TagSpecifications"][wa[0]]["Tags"][wa[1]]["Value"] = "<digest>"
+            b["TagSpecifications"][wb[0]]["Tags"][wb[1]]["Value"] = "<digest>"
+            return _diff(a, b, "")
+
+
+        def _diff(a, b, path: str) -> list[str]:
+            if isinstance(a, dict) and isinstance(b, dict):
+                out = []
+                for key in sorted(set(a) | set(b)):
+                    out += _diff(a.get(key), b.get(key), f"{path}.{key}" if path else key)
+                return out
+            if isinstance(a, list) and isinstance(b, list):
+                if len(a) != len(b):
+                    return [f"{path}: list length {len(a)} -> {len(b)}"]
+                out = []
+                for i, (x, y) in enumerate(zip(a, b)):
+                    out += _diff(x, y, f"{path}[{i}]")
+                return out
+            if a != b:
+                return [f"{path}: {a!r} -> {b!r}"]
+            return []
+
+
+        def hardened_launch_template(data: dict) -> list[str]:
+            """Return the launch-template properties this deploy refuses to run without."""
+            problems = []
+            if data.get("KeyName"):
+                problems.append("KeyName is set: no SSH key pair may exist")
+            meta = data.get("MetadataOptions", {})
+            if meta.get("HttpTokens") != "required":
+                problems.append("MetadataOptions.HttpTokens must be 'required' (IMDSv2)")
+            if meta.get("InstanceMetadataTags") != "enabled":
+                problems.append(
+                    "MetadataOptions.InstanceMetadataTags must be 'enabled' (the digest is read from the tag)"
+                )
+            if meta.get("HttpPutResponseHopLimit", 1) != 1:
+                problems.append("MetadataOptions.HttpPutResponseHopLimit must be 1")
+            if not data.get("IamInstanceProfile"):
+                problems.append("IamInstanceProfile is missing")
+            if data.get("UserData"):
+                problems.append(
+                    "UserData is set: the bootstrap is baked into the AMI, not passed at launch"
+                )
+            if find_digest_tag(data) is None:
+                problems.append(f"instance tag {DIGEST_TAG!r} is missing")
+            return problems
+
+
+        def describe_version(ec2, lt_id: str, version: str) -> dict:
+            resp = ec2.describe_launch_template_versions(LaunchTemplateId=lt_id, Versions=[version])
+            versions = resp.get("LaunchTemplateVersions", [])
+            if len(versions) != 1:
+                raise RuntimeError(f"launch template {lt_id} version {version} not found")
+            return versions[0]["LaunchTemplateData"]
+
+
+        def handler(events, context):
+            lt_id = events["LaunchTemplateId"]
+            if events["GroupLaunchTemplateId"] != lt_id:
+                raise RuntimeError("the Auto Scaling group does not use the launch template this document is scoped to")
+            stable = events["StableVersion"]
+            if not stable.isdigit():
+                raise RuntimeError(f"the group must pin a numbered launch-template version, found {stable!r}")
+            digest = events["ArtifactDigest"]
+
+            if events["Environment"] == "prod":
+                bucket, key = events["PromotionBucket"], events["PromotionMarkerKey"]
+                if not bucket or not key:
+                    raise RuntimeError("prod requires the promotion marker location")
+                if key != f"promotions/backend/{digest.split(':')[1]}.dev-ok":
+                    raise RuntimeError("the promotion marker key does not belong to this digest")
+                marker = json.loads(boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read())
+                if marker.get("digest") != digest or marker.get("environment") != "dev":
+                    raise RuntimeError("the promotion marker does not attest this digest passed dev")
+
+            ec2 = boto3.client("ec2")
+            current = describe_version(ec2, lt_id, stable)
+            problems = hardened_launch_template(current)
+            if problems:
+                raise RuntimeError("stable launch template is not hardened: " + "; ".join(problems))
+            i, j = find_digest_tag(current)
+            if current["TagSpecifications"][i]["Tags"][j]["Value"] == digest:
+                return {"PreviousVersion": stable, "NewVersion": stable, "AlreadyCurrent": "true"}
+
+            new = next_version_data(current, digest)
+            diffs = only_digest_changed(current, new)
+            if diffs:
+                raise RuntimeError("refusing: more than the digest would change: " + "; ".join(diffs))
+
+            created = ec2.create_launch_template_version(
+                LaunchTemplateId=lt_id,
+                SourceVersion=stable,
+                VersionDescription=(events.get("ReleaseDescription") or f"{events['Environment']} {digest}")[:255],
+                LaunchTemplateData=new,
+            )["LaunchTemplateVersion"]
+            new_version = str(created["VersionNumber"])
+            stored = describe_version(ec2, lt_id, new_version)
+            diffs = only_digest_changed(current, stored)
+            if diffs:
+                raise RuntimeError("the stored launch-template version differs beyond the digest: " + "; ".join(diffs))
+            return {"PreviousVersion": stable, "NewVersion": new_version, "AlreadyCurrent": "false"}
+    outputs:
+      - Name: PreviousVersion
+        Selector: '$.Payload.PreviousVersion'
+        Type: String
+      - Name: NewVersion
+        Selector: '$.Payload.NewVersion'
+        Type: String
+      - Name: AlreadyCurrent
+        Selector: '$.Payload.AlreadyCurrent'
+        Type: String
+
+  - name: SkipIfAlreadyCurrent
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: VerifyFleet
+          Variable: '{{ PrepareLaunchTemplateVersion.AlreadyCurrent }}'
+          StringEquals: 'true'
+      Default: StartInstanceRefresh
+
+  - name: StartInstanceRefresh
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+        LaunchTemplateId: '{{ LaunchTemplateId }}'
+        NewVersion: '{{ PrepareLaunchTemplateVersion.NewVersion }}'
+        AlarmNames: '{{ AlarmNames }}'
+        MinHealthyPercentage: '{{ MinHealthyPercentage }}'
+        MaxHealthyPercentage: '{{ MaxHealthyPercentage }}'
+        InstanceWarmupSeconds: '{{ InstanceWarmupSeconds }}'
+        BakeTimeSeconds: '{{ BakeTimeSeconds }}'
+        CheckpointPercentages: '{{ CheckpointPercentages }}'
+        CheckpointDelaySeconds: '{{ CheckpointDelaySeconds }}'
+      Script: |
+        import boto3
+
+
+        def handler(events, context):
+            prefs = {
+                "MinHealthyPercentage": int(events["MinHealthyPercentage"]),
+                "MaxHealthyPercentage": int(events["MaxHealthyPercentage"]),
+                "InstanceWarmup": int(events["InstanceWarmupSeconds"]),
+                "BakeTime": int(events["BakeTimeSeconds"]),
+                "AutoRollback": True,
+                "SkipMatching": False,
+                "ScaleInProtectedInstances": "Refresh",
+                "StandbyInstances": "Terminate",
+            }
+            if prefs["MinHealthyPercentage"] < 100:
+                raise RuntimeError("MinHealthyPercentage below 100 lets capacity drop during the rollout")
+            alarms = [a for a in events.get("AlarmNames", []) if a]
+            if alarms:
+                prefs["AlarmSpecification"] = {"Alarms": alarms}
+            checkpoints = [int(c) for c in events.get("CheckpointPercentages", []) if c]
+            if checkpoints:
+                if checkpoints[-1] != 100:
+                    raise RuntimeError("checkpoints must end at 100")
+                prefs["CheckpointPercentages"] = checkpoints
+                prefs["CheckpointDelay"] = int(events["CheckpointDelaySeconds"])
+            resp = boto3.client("autoscaling").start_instance_refresh(
+                AutoScalingGroupName=events["AutoScalingGroupName"],
+                Strategy="Rolling",
+                DesiredConfiguration={"LaunchTemplate": {
+                    "LaunchTemplateId": events["LaunchTemplateId"],
+                    "Version": events["NewVersion"],
+                }},
+                Preferences=prefs,
+            )
+            return {"InstanceRefreshId": resp["InstanceRefreshId"]}
+    outputs:
+      - Name: InstanceRefreshId
+        Selector: '$.Payload.InstanceRefreshId'
+        Type: String
+
+  - name: WaitForTerminalState
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 7200
+    inputs:
+      Service: autoscaling
+      Api: DescribeInstanceRefreshes
+      AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+      InstanceRefreshIds:
+        - '{{ StartInstanceRefresh.InstanceRefreshId }}'
+      PropertySelector: '$.InstanceRefreshes[0].Status'
+      DesiredValues:
+        - Successful
+        - Failed
+        - Cancelled
+        - RollbackSuccessful
+        - RollbackFailed
+
+  - name: ReadOutcome
+    action: aws:executeAwsApi
+    inputs:
+      Service: autoscaling
+      Api: DescribeInstanceRefreshes
+      AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+      InstanceRefreshIds:
+        - '{{ StartInstanceRefresh.InstanceRefreshId }}'
+    outputs:
+      - Name: Status
+        Selector: '$.InstanceRefreshes[0].Status'
+        Type: String
+      - Name: StatusReason
+        Selector: '$.InstanceRefreshes[0].StatusReason'
+        Type: String
+
+  - name: BranchOnOutcome
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: VerifyFleet
+          Variable: '{{ ReadOutcome.Status }}'
+          StringEquals: Successful
+      Default: FailRollout
+
+  - name: VerifyFleet
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+        LaunchTemplateId: '{{ LaunchTemplateId }}'
+        NewVersion: '{{ PrepareLaunchTemplateVersion.NewVersion }}'
+      Script: |
+        import boto3
+
+
+        def handler(events, context):
+            group = boto3.client("autoscaling").describe_auto_scaling_groups(
+                AutoScalingGroupNames=[events["AutoScalingGroupName"]])["AutoScalingGroups"][0]
+            in_service = [i for i in group["Instances"] if i["LifecycleState"] == "InService"]
+            stale = [i["InstanceId"] for i in in_service
+                     if i.get("LaunchTemplate", {}).get("LaunchTemplateId") != events["LaunchTemplateId"]
+                     or i.get("LaunchTemplate", {}).get("Version") != events["NewVersion"]]
+            if not in_service:
+                raise RuntimeError("no InService instance in the group")
+            if stale:
+                raise RuntimeError(f"instances still on another launch-template version: {stale}")
+            return {"InstancesOnNewVersion": str(len(in_service))}
+    outputs:
+      - Name: InstancesOnNewVersion
+        Selector: '$.Payload.InstancesOnNewVersion'
+        Type: String
+
+  - name: FailRollout
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Status: '{{ ReadOutcome.Status }}'
+        StatusReason: '{{ ReadOutcome.StatusReason }}'
+        InstanceRefreshId: '{{ StartInstanceRefresh.InstanceRefreshId }}'
+      Script: |
+        def handler(events, context):
+            raise RuntimeError(
+                f"instance refresh {events['InstanceRefreshId']} ended {events['Status']}: {events['StatusReason']}")

@@ -1,0 +1,448 @@
+---
+name: build-publish
+
+# Build once. The artifact identity is an OCI digest; tags are never trusted.
+# Two jobs on purpose: `build` runs application code (npm, tests, the container) with no
+# credentials at all; `publish` holds the OIDC, registry and attestation permissions and
+# never executes anything from the application repository.
+on:
+  workflow_call:
+    inputs:
+      app_dir:
+        type: string
+        default: '.'
+      stack:
+        type: string
+        required: true
+      node_version:
+        type: string
+        default: '24'
+      artifact_kind:
+        description: >-
+          image (container), bundle (runnable tree for an EC2 host without a container
+          runtime) or static (browser bundle for S3). All three are pushed as OCI
+          artifacts and identified by digest.
+        type: string
+        required: true
+      registry:
+        description: ghcr or ecr
+        type: string
+        required: true
+      image_name:
+        description: Full repository name without a tag, e.g. ghcr.io/org/app or 123.dkr.ecr.region.amazonaws.com/app
+        type: string
+        required: true
+      dockerfile:
+        type: string
+        default: Dockerfile
+      publish:
+        description: Push, scan, sign and attest (false = build and test only, as on pull requests)
+        type: boolean
+        default: false
+      fail_on:
+        type: string
+        default: high
+      aws_region:
+        type: string
+        default: ''
+      ecr_publish_role_arn:
+        type: string
+        default: ''
+    outputs:
+      digest:
+        description: The published artifact digest (empty when publish is false)
+        value: ${{ jobs.publish.outputs.digest }}
+      artifact:
+        value: ${{ inputs.image_name }}
+      release_sha:
+        value: ${{ github.sha }}
+
+permissions: {}
+
+env:
+  TEMPLATE_DIR: .ci-templates
+
+jobs:
+  build:
+    name: Build and test (no credentials)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout
+    outputs:
+      artifact_name: ${{ steps.validate.outputs.artifact_name }}
+    env:
+      APP_DIR: ${{ inputs.app_dir }}
+      IMAGE: ${{ inputs.image_name }}
+      RELEASE_SHA: ${{ github.sha }}
+      OUT_DIR: ${{ github.workspace }}/ci-out
+    steps:
+      - name: Validate inputs
+        id: validate
+        env:
+          KIND: ${{ inputs.artifact_kind }}
+          REGISTRY: ${{ inputs.registry }}
+          ROLE: ${{ inputs.ecr_publish_role_arn }}
+          PUBLISH: ${{ inputs.publish }}
+          RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          echo "artifact_name=release-${RUN_KEY}-${KIND}-$(tr -c 'A-Za-z0-9\n' '-' <<<"$APP_DIR")" >> "$GITHUB_OUTPUT"
+          [[ "$KIND" =~ ^(image|bundle|static)$ ]] || { echo "::error::artifact_kind must be image, bundle or static"; exit 1; }
+          [[ "$REGISTRY" =~ ^(ghcr|ecr)$ ]] || { echo "::error::registry must be ghcr or ecr"; exit 1; }
+          [[ "$IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$ ]] || { echo "::error::image_name must be a lowercase repository without a tag"; exit 1; }
+          [[ "$APP_DIR" =~ ^[A-Za-z0-9._/-]+$ && "$APP_DIR" != *..* ]] || { echo "::error::app_dir must be a plain relative path"; exit 1; }
+          if [[ "$REGISTRY" == "ecr" && "$PUBLISH" == "true" && -z "$ROLE" ]]; then
+            echo "::error::ecr_publish_role_arn is required to publish to ECR"; exit 1
+          fi
+          mkdir -p "$OUT_DIR"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out this template revision (not the caller's repository)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ${{ env.TEMPLATE_DIR }}
+          persist-credentials: false
+      - name: Translate scan-ignore.yml for the artifact scan (expired entries are re-flagged)
+        run: python3 "${TEMPLATE_DIR}/ci/scripts/scan_ignore.py" "${APP_DIR}/.ci/scan-ignore.yml" "$OUT_DIR"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Install from the lockfile
+        working-directory: ${{ inputs.app_dir }}
+        run: npm ci
+
+      # ---------------------------------------------------------------- image
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        if: ${{ inputs.artifact_kind == 'image' }}
+      - name: Build the image into the local daemon
+        if: ${{ inputs.artifact_kind == 'image' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: ${{ inputs.app_dir }}  # zizmor: ignore[template-injection] validated above: plain relative path, no '..'
+          file: ${{ inputs.app_dir }}/${{ inputs.dockerfile }}  # zizmor: ignore[template-injection] same validation
+          push: false
+          load: true
+          tags: ${{ inputs.image_name }}:sha-${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          sbom: false
+      - name: Run the image hardened and check its health endpoint
+        if: ${{ inputs.artifact_kind == 'image' }}
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+            -p 127.0.0.1:3000:3000 "${IMAGE}:sha-${RELEASE_SHA}")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 15); do
+            if body="$(curl -fsS -m 2 http://127.0.0.1:3000/health 2>/dev/null)"; then
+              jq -e --arg v "$RELEASE_SHA" '.status == "ok" and .version == $v' <<<"$body" >/dev/null
+              echo "health: $body"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the container never became healthy"; docker logs "$cid"; exit 1
+      - name: Export the same build as an OCI image layout (what publish pushes)
+        if: ${{ inputs.artifact_kind == 'image' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: ${{ inputs.app_dir }}  # zizmor: ignore[template-injection] validated above
+          file: ${{ inputs.app_dir }}/${{ inputs.dockerfile }}  # zizmor: ignore[template-injection] validated above
+          push: false
+          tags: ${{ inputs.image_name }}:sha-${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          sbom: false
+          outputs: type=oci,dest=${{ github.workspace }}/ci-out/image.tar
+
+      # --------------------------------------------------------------- bundle
+      - name: Assemble the runnable tree, production dependencies only
+        if: ${{ inputs.artifact_kind == 'bundle' }}
+        working-directory: ${{ inputs.app_dir }}
+        run: |
+          set -euo pipefail
+          npm ci --omit=dev --ignore-scripts
+          test -f package.json
+          # Only what runs ships, so the scan below sees the shipped tree, not the build graph.
+          paths=(./package.json ./src)
+          if [[ -d migrations ]]; then paths+=(./migrations); fi
+          if [[ -d node_modules ]]; then paths+=(./node_modules); fi
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner --format=gnu \
+            --exclude='./node_modules/.bin' --exclude='./node_modules/.package-lock.json' \
+            -cf - "${paths[@]}" | gzip -n -9 > "${OUT_DIR}/app-${RELEASE_SHA}.tar.gz"
+          ( cd "$OUT_DIR" && sha256sum "app-${RELEASE_SHA}.tar.gz" > bundle.sha256 && cat bundle.sha256 )
+      - name: Check the migration authoring rules
+        if: ${{ inputs.artifact_kind == 'bundle' }}
+        env:
+          APP_DIR: ${{ inputs.app_dir }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/check-migrations.sh"
+      - name: Install the pinned scanner
+        if: ${{ inputs.artifact_kind == 'bundle' }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/install-tool.sh" trivy
+      - name: Scan the extracted bundle, the bytes that will run on the instance
+        if: ${{ inputs.artifact_kind == 'bundle' }}
+        env:
+          FAIL_ON: ${{ inputs.fail_on }}
+        run: |
+          set -euo pipefail
+          python3 "${TEMPLATE_DIR}/ci/scripts/extract-bundle.py" --layout app \
+            "${OUT_DIR}/app-${RELEASE_SHA}.tar.gz" "${OUT_DIR}/bundle" > "${OUT_DIR}/bundle-files.txt"
+          wc -l < "${OUT_DIR}/bundle-files.txt" | xargs printf '%s file(s) in the bundle\n'
+          BUNDLE_DIR="${OUT_DIR}/bundle" bash "${TEMPLATE_DIR}/ci/scripts/gate-bundle.sh"
+      - name: Run the extracted bundle and check its health endpoint
+        if: ${{ inputs.artifact_kind == 'bundle' }}
+        working-directory: ${{ github.workspace }}/ci-out/bundle
+        env:
+          NODE_ENV: production
+          PORT: '3010'
+        run: |
+          set -euo pipefail
+          # The bundle-mode instance runs exactly this tree with exactly this command.
+          APP_VERSION="$RELEASE_SHA" node src/server.js &
+          app=$!
+          trap 'kill "$app" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 15); do
+            if body="$(curl -fsS -m 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null)"; then
+              jq -e --arg v "$RELEASE_SHA" '.status == "ok" and .version == $v' <<<"$body" >/dev/null
+              echo "health: $body"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the bundle never became healthy"; exit 1
+      - name: Remove the extracted copy (the tar is the artifact)
+        if: ${{ always() && inputs.artifact_kind == 'bundle' }}
+        run: rm -rf "${OUT_DIR}/bundle"
+
+      # --------------------------------------------------------------- static
+      - name: Build the static bundle (deterministic tar) and prune to production dependencies
+        if: ${{ inputs.artifact_kind == 'static' }}
+        working-directory: ${{ inputs.app_dir }}
+        env:
+          APP_VERSION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          npm run build
+          test -f dist/index.html
+          find dist -type d -exec chmod 755 {} +
+          find dist -type f -exec chmod 644 {} +
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner --format=gnu \
+            -cf - -C dist . | gzip -n -9 > "${OUT_DIR}/frontend-${RELEASE_SHA}.tar.gz"
+          sha256sum "${OUT_DIR}/frontend-${RELEASE_SHA}.tar.gz"
+          mkdir -p "${OUT_DIR}/extract-check"
+          python3 "${GITHUB_WORKSPACE}/${TEMPLATE_DIR}/ci/scripts/extract-bundle.py" \
+            "${OUT_DIR}/frontend-${RELEASE_SHA}.tar.gz" "${OUT_DIR}/extract-check" > /dev/null
+          rm -rf "${OUT_DIR}/extract-check"
+          npm prune --omit=dev
+      - name: Install the pinned SBOM tool
+        if: ${{ inputs.artifact_kind == 'static' }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/install-tool.sh" trivy
+      - name: Production-dependency SBOM of the bundle's build
+        if: ${{ inputs.artifact_kind == 'static' }}
+        run: trivy fs --quiet --scanners vuln --format cyclonedx --output "${OUT_DIR}/sbom.cdx.json" "$APP_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.validate.outputs.artifact_name }}
+          path: |
+            ci-out/image.tar
+            ci-out/frontend-*.tar.gz
+            ci-out/app-*.tar.gz
+            ci-out/bundle.sha256
+            ci-out/bundle-files.txt
+            ci-out/sbom.cdx.json
+            ci-out/trivy-bundle*.json
+            ci-out/trivyignore.yaml
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish, scan, sign, attest (no application code)
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # template checkout
+      packages: write  # push artifact, signature and attestations
+      id-token: write  # keyless signing and OIDC to AWS
+      attestations: write  # GitHub provenance and SBOM attestations
+    outputs:
+      digest: ${{ steps.result.outputs.digest }}
+    env:
+      IMAGE: ${{ inputs.image_name }}
+      RELEASE_SHA: ${{ github.sha }}
+      KIND: ${{ inputs.artifact_kind }}
+      FAIL_ON: ${{ inputs.fail_on }}
+      OUT_DIR: ${{ github.workspace }}/ci-out
+      SOURCE_REPO: ${{ github.repository }}
+      SOURCE_REF: ${{ github.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out this template revision only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ${{ env.TEMPLATE_DIR }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: ${{ github.workspace }}/ci-out
+      - name: Install pinned tools
+        run: |
+          set -euo pipefail
+          for tool in cosign oras trivy; do
+            bash "${TEMPLATE_DIR}/ci/scripts/install-tool.sh" "$tool"
+          done
+
+      - name: Log in to GitHub Container Registry
+        if: ${{ inputs.registry == 'ghcr' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Assume the ECR publish role (OIDC, no static keys)
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.ecr_publish_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-publish-${{ github.run_id }}
+          audience: sts.amazonaws.com
+      - name: Log in to Amazon ECR
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
+
+      - name: Reuse the release already published for this commit, if any
+        id: existing
+        env:
+          TEMPLATE_REPO: ${{ job.workflow_repository }}
+          TEMPLATE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if digest="$(oras manifest fetch --descriptor "${IMAGE}:sha-${RELEASE_SHA}" 2>/dev/null | jq -r .digest)" && [[ -n "$digest" ]]; then
+            echo "a release tagged sha-${RELEASE_SHA} exists (${digest}); verifying it before reusing it"
+            SUBJECT="${IMAGE}@${digest}" SOURCE_SHA="$RELEASE_SHA" bash "${TEMPLATE_DIR}/ci/scripts/verify-release.sh"
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+            echo "### Reused release \`${RELEASE_SHA}\` → \`${digest}\` (already published and verified)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the artifact (digest-preserving copy of the OCI layout)
+        id: push
+        if: ${{ steps.existing.outputs.digest == '' }}
+        run: |
+          set -euo pipefail
+          case "$KIND" in
+            image)
+              oras cp --from-oci-layout "${OUT_DIR}/image.tar:sha-${RELEASE_SHA}" "${IMAGE}:sha-${RELEASE_SHA}" ;;
+            bundle)
+              cd "$OUT_DIR"
+              # The scanned bytes are the pushed bytes.
+              sha256sum -c bundle.sha256
+              oras push "${IMAGE}:sha-${RELEASE_SHA}" \
+                --artifact-type application/vnd.example.app-bundle.v1+tar \
+                --annotation "org.opencontainers.image.revision=${RELEASE_SHA}" \
+                "app-${RELEASE_SHA}.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip" ;;
+            static)
+              cd "$OUT_DIR"
+              oras push "${IMAGE}:sha-${RELEASE_SHA}" \
+                --artifact-type application/vnd.example.frontend-bundle.v1+tar \
+                --annotation "org.opencontainers.image.revision=${RELEASE_SHA}" \
+                "frontend-${RELEASE_SHA}.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip" ;;
+          esac
+          digest="$(oras manifest fetch --descriptor "${IMAGE}:sha-${RELEASE_SHA}" | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest after push: ${digest}"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Resolve the digest
+        id: result
+        env:
+          EXISTING: ${{ steps.existing.outputs.digest }}
+          PUSHED: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest="${EXISTING:-${PUSHED:-}}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the pushed image (vulnerabilities with the expiring ignore file, any baked secret, SBOM)
+        if: ${{ inputs.artifact_kind == 'image' && steps.existing.outputs.digest == '' }}
+        env:
+          IMAGE_REF: ${{ inputs.image_name }}@${{ steps.result.outputs.digest }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/gate-image.sh"
+      - name: 'Sign with cosign (keyless; the identity is this workflow) and attest the SBOM'
+        if: ${{ steps.existing.outputs.digest == '' }}
+        env:
+          DIGEST: ${{ steps.result.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sbom="${OUT_DIR}/sbom-image.cdx.json"
+          [[ "$KIND" == "image" ]] || sbom="${OUT_DIR}/sbom.cdx.json"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type cyclonedx --predicate "$sbom" "${IMAGE}@${DIGEST}"
+          cp "$sbom" "${OUT_DIR}/sbom-attested.cdx.json"
+      - name: Attest build provenance (SLSA v1)
+        if: ${{ steps.existing.outputs.digest == '' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ inputs.image_name }}
+          subject-digest: ${{ steps.result.outputs.digest }}
+          push-to-registry: true
+      - name: Attest the SBOM
+        if: ${{ steps.existing.outputs.digest == '' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e  # v4.1.0
+        with:
+          subject-name: ${{ inputs.image_name }}
+          subject-digest: ${{ steps.result.outputs.digest }}
+          sbom-path: ${{ github.workspace }}/ci-out/sbom-attested.cdx.json
+          push-to-registry: true
+      - name: Verify what was just published exactly as a deploy will
+        if: ${{ steps.existing.outputs.digest == '' }}
+        env:
+          SUBJECT: ${{ inputs.image_name }}@${{ steps.result.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          TEMPLATE_REPO: ${{ job.workflow_repository }}
+          TEMPLATE_SHA: ${{ job.workflow_sha }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/verify-release.sh"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.result.outputs.digest }}
+          TEMPLATE_REPO: ${{ job.workflow_repository }}
+          TEMPLATE_SHA: ${{ job.workflow_sha }}
+        run: |
+          {
+            echo "### Published ${KIND} \`${IMAGE}\`"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| release | \`${RELEASE_SHA}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| signed by | \`${TEMPLATE_REPO}/.github/workflows/build-publish.yml\` at \`${TEMPLATE_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: publish-scan-${{ needs.build.outputs.artifact_name }}
+          path: |
+            ci-out/sbom*.cdx.json
+            ci-out/trivy-image*.json
+            ci-out/trivy-bundle*.json
+            ci-out/bundle-files.txt
+          if-no-files-found: ignore
+          retention-days: 30

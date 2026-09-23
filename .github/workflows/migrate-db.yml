@@ -1,0 +1,126 @@
+---
+name: migrate-db
+
+# Database migrations for one verified release, applied by a job on an ephemeral EC2 host
+# through the version-pinned Automation runbook. The runner never connects to the database:
+# it holds no database credentials, has no network path into the data subnet, and its only
+# permission here is to start one numbered version of one document.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev or prod
+        type: string
+        required: true
+      artifact:
+        description: Artifact repository without a tag
+        type: string
+        required: true
+      digest:
+        description: Artifact digest; empty means resolve it from the sha-<release_sha> tag
+        type: string
+        default: ''
+      release_sha:
+        type: string
+        required: true
+      registry:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  TEMPLATE_DIR: .ci-templates
+
+jobs:
+  migrate:
+    name: Migrate the ${{ inputs.environment }} database
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    # The same lock deploy-ec2.yml takes, so a schema change and a rollout of this
+    # application and environment are serialised across runs, not only within one.
+    concurrency:
+      group: backend-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read  # checkout
+      packages: write  # the migration promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's migration role
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      ARTIFACT: ${{ inputs.artifact }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Validate inputs
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ENVIRONMENT" =~ ^(dev|prod)$ ]] || { echo "::error::environment must be dev or prod"; exit 1; }
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::release_sha must be a full commit SHA"; exit 1; }
+          [[ -z "$DIGEST" || "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest is malformed"; exit 1; }
+      - name: Check out this template revision (not the caller's repository)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ${{ env.TEMPLATE_DIR }}
+          persist-credentials: false
+      - name: Install pinned tools
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for tool in cosign oras; do
+            bash "${TEMPLATE_DIR}/ci/scripts/install-tool.sh" "$tool"
+          done
+      - name: Log in to GitHub Container Registry
+        if: ${{ !inputs.dry_run && inputs.registry == 'ghcr' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Assume the ${{ inputs.environment }} migration role (OIDC, no static keys)
+        if: ${{ !inputs.dry_run }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_MIGRATE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-migrate-${{ inputs.environment }}-${{ github.run_id }}
+          audience: sts.amazonaws.com
+      - name: Log in to Amazon ECR
+        if: ${{ !inputs.dry_run && inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
+      - name: Resolve the digest from the release tag when none was passed
+        id: digest
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" && "$DRY_RUN" != "true" ]]; then
+            DIGEST="$(oras manifest fetch --descriptor "${ARTIFACT}:sha-${RELEASE_SHA}" | jq -r .digest)"
+          fi
+          [[ "$DRY_RUN" == "true" || "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no release published for ${RELEASE_SHA}"; exit 1; }
+          echo "digest=${DIGEST:-sha256:$(printf '0%.0s' $(seq 1 64))}" >> "$GITHUB_OUTPUT"
+      - name: Migrate
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PROMOTION_BUCKET: ${{ vars.PROMOTION_BUCKET }}
+          SSM_DOCUMENT_ARN: ${{ vars.SSM_MIGRATE_DOCUMENT_ARN }}
+          SSM_DOCUMENT_VERSION: ${{ vars.SSM_MIGRATE_DOCUMENT_VERSION }}
+          AUTOMATION_ROLE_ARN: ${{ vars.SSM_MIGRATE_AUTOMATION_ROLE_ARN }}
+          MIGRATION_LAUNCH_TEMPLATE_ID: ${{ vars.MIGRATION_LAUNCH_TEMPLATE_ID }}
+          MIGRATION_LAUNCH_TEMPLATE_VERSION: ${{ vars.MIGRATION_LAUNCH_TEMPLATE_VERSION }}
+          DB_CLUSTER_IDENTIFIER: ${{ vars.DB_CLUSTER_IDENTIFIER }}
+          RESULT_PARAMETER_PREFIX: ${{ vars.MIGRATION_RESULT_PARAMETER_PREFIX }}
+          TEMPLATE_REPO: ${{ job.workflow_repository }}
+          TEMPLATE_SHA: ${{ job.workflow_sha }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_REF: refs/heads/main
+          GH_TOKEN: ${{ github.token }}
+        run: bash "${TEMPLATE_DIR}/ci/scripts/migrate-db.sh"

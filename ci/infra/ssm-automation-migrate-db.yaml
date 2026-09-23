@@ -1,0 +1,249 @@
+---
+description: >-
+  Run the database migrations carried by one verified release as a job on an ephemeral EC2
+  host: snapshot the cluster, launch the host from a pinned launch template with the digest
+  in its tags, wait for the outcome the host publishes to Parameter Store, then terminate
+  it. The GitHub runner may only start this document; it has no database credentials, no
+  network path to the database and no EC2 rights of its own.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+  Environment:
+    type: String
+    allowedValues: [dev, prod]
+  ArtifactDigest:
+    type: String
+    allowedPattern: '^sha256:[0-9a-f]{64}$'
+  ReleaseSha:
+    type: String
+    allowedPattern: '^[0-9a-f]{40}$'
+  LaunchTemplateId:
+    description: The migration launch template; its version pins the AMI, the instance profile and the subnet.
+    type: String
+    allowedPattern: '^lt-[0-9a-f]{17}$'
+  LaunchTemplateVersion:
+    description: A numbered version. $Latest and $Default are refused, so a template edit cannot change what runs.
+    type: String
+    allowedPattern: '^[0-9]+$'
+  DBClusterIdentifier:
+    type: String
+    allowedPattern: '^[a-z][a-z0-9-]{0,62}$'
+  ResultParameterPrefix:
+    description: Parameter Store prefix the job writes its outcome under.
+    type: String
+    allowedPattern: '^/[A-Za-z0-9._/-]{1,1000}$'
+  TimeoutSeconds:
+    type: Integer
+    default: 1800
+  ReleaseDescription:
+    type: String
+    default: ''
+    allowedPattern: '^[A-Za-z0-9 :/._@-]{0,255}$'
+outputs:
+  - SnapshotCluster.SnapshotIdentifier
+  - LaunchJobHost.InstanceId
+  - ReadOutcome.Status
+  - ReadOutcome.Detail
+  - TerminateJobHost.Terminated
+mainSteps:
+  # A migration is the one deploy step that is not reversible by redeploying the previous
+  # release, so the restore point is taken before the host exists.
+  - name: SnapshotCluster
+    action: aws:executeScript
+    timeoutSeconds: 600
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        ClusterId: '{{ DBClusterIdentifier }}'
+        Environment: '{{ Environment }}'
+        ReleaseSha: '{{ ReleaseSha }}'
+      Script: |
+        import time
+
+        import boto3
+
+
+        def handler(events, context):
+            rds = boto3.client("rds")
+            snapshot_id = "pre-migrate-{}-{}-{}".format(
+                events["Environment"], events["ReleaseSha"][:12], time.strftime("%Y%m%d%H%M%S")
+            )
+            rds.create_db_cluster_snapshot(
+                DBClusterSnapshotIdentifier=snapshot_id,
+                DBClusterIdentifier=events["ClusterId"],
+                Tags=[
+                    {"Key": "app:release", "Value": events["ReleaseSha"]},
+                    {"Key": "app:purpose", "Value": "pre-migration restore point"},
+                ],
+            )
+            deadline = time.time() + 540
+            while time.time() < deadline:
+                described = rds.describe_db_cluster_snapshots(
+                    DBClusterSnapshotIdentifier=snapshot_id
+                )["DBClusterSnapshots"][0]
+                if described["Status"] == "available":
+                    return {"SnapshotIdentifier": snapshot_id}
+                if described["Status"] in ("failed", "incompatible-restore"):
+                    raise Exception(f"snapshot {snapshot_id} ended {described['Status']}")
+                time.sleep(15)
+            raise Exception(f"snapshot {snapshot_id} was not available in time")
+    outputs:
+      - Name: SnapshotIdentifier
+        Selector: $.Payload.SnapshotIdentifier
+        Type: String
+
+  # Seeded before the host exists so the wait below has a parameter to watch, and so a
+  # value left by any earlier run cannot be read as this one's result.
+  - name: SeedResultStatus
+    action: aws:executeAwsApi
+    timeoutSeconds: 120
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '{{ ResultParameterPrefix }}/{{ ReleaseSha }}/{{ automation:EXECUTION_ID }}/status'
+      Value: pending
+      Type: String
+      Overwrite: true
+
+  - name: LaunchJobHost
+    action: aws:executeAwsApi
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateJobHost'
+    onCancel: 'step:TerminateJobHost'
+    inputs:
+      Service: ec2
+      Api: RunInstances
+      MinCount: 1
+      MaxCount: 1
+      LaunchTemplate:
+        LaunchTemplateId: '{{ LaunchTemplateId }}'
+        Version: '{{ LaunchTemplateVersion }}'
+      InstanceInitiatedShutdownBehavior: terminate
+      TagSpecifications:
+        - ResourceType: instance
+          Tags:
+            - Key: Name
+              Value: 'backend-migrate-{{ Environment }}'
+            - Key: app:job
+              Value: migrate
+            - Key: app:artifact-kind
+              Value: bundle
+            - Key: app:artifact-digest
+              Value: '{{ ArtifactDigest }}'
+            - Key: app:release
+              Value: '{{ ReleaseSha }}'
+            - Key: app:result-parameter
+              # Unique per execution: a result left behind by an earlier run can never be
+              # mistaken for this one's proof.
+              Value: '{{ ResultParameterPrefix }}/{{ ReleaseSha }}/{{ automation:EXECUTION_ID }}'
+              # The host writes <this>/status (ok|failed) and <this>/detail (JSON).
+            - Key: app:automation-execution
+              Value: '{{ automation:EXECUTION_ID }}'
+            - Key: app:description
+              Value: '{{ ReleaseDescription }}'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.Instances[0].InstanceId'
+        Type: String
+
+  # The host publishes its own outcome; nothing executes a command on it, so no remote
+  # execution path into the data subnet exists. The wait is a waitForAwsResourceProperty
+  # step, because aws:executeScript is capped at 600 seconds and a migration may take longer.
+  - name: WaitForStatus
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: '{{ TimeoutSeconds }}'
+    onFailure: 'step:TerminateJobHost'
+    onCancel: 'step:TerminateJobHost'
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: '{{ ResultParameterPrefix }}/{{ ReleaseSha }}/{{ automation:EXECUTION_ID }}/status'
+      PropertySelector: '$.Parameter.Value'
+      DesiredValues: [ok, failed]
+
+  - name: ReadOutcome
+    action: aws:executeScript
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateJobHost'
+    onCancel: 'step:TerminateJobHost'
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        StatusName: '{{ ResultParameterPrefix }}/{{ ReleaseSha }}/{{ automation:EXECUTION_ID }}/status'
+        DetailName: '{{ ResultParameterPrefix }}/{{ ReleaseSha }}/{{ automation:EXECUTION_ID }}/detail'
+        ExpectedDigest: '{{ ArtifactDigest }}'
+        ExpectedReleaseSha: '{{ ReleaseSha }}'
+        InstanceId: '{{ LaunchJobHost.InstanceId }}'
+      Script: |
+        import json
+
+        import boto3
+
+
+        def handler(events, context):
+            ssm = boto3.client("ssm")
+            status = ssm.get_parameter(Name=events["StatusName"])["Parameter"]["Value"]
+            detail = json.loads(ssm.get_parameter(Name=events["DetailName"])["Parameter"]["Value"])
+            # Somebody else's run is never this one's proof: the digest, the release and the
+            # instance that published it all have to be this execution's.
+            expected = {
+                "digest": events["ExpectedDigest"],
+                "release_sha": events["ExpectedReleaseSha"],
+                "instance": events["InstanceId"],
+            }
+            mismatched = {
+                key: detail.get(key) for key, want in expected.items() if detail.get(key) != want
+            }
+            if mismatched:
+                raise Exception(f"the result does not belong to this execution: {mismatched}")
+            if status != "ok":
+                raise Exception("the migration job reported failure: " + detail.get("detail", ""))
+            return {"Status": status, "Detail": detail.get("detail", "")}
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+      - Name: Detail
+        Selector: $.Payload.Detail
+        Type: String
+
+  - name: TerminateJobHost
+    action: aws:executeScript
+    timeoutSeconds: 300
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        ExecutionId: '{{ automation:EXECUTION_ID }}'
+      Script: |
+        import boto3
+
+
+        def handler(events, context):
+            # Terminating by tag rather than by a step output also catches a host that was
+            # launched moments before this automation failed or was cancelled.
+            ec2 = boto3.client("ec2")
+            reservations = ec2.describe_instances(
+                Filters=[
+                    {"Name": "tag:app:job", "Values": ["migrate"]},
+                    {"Name": "tag:app:automation-execution", "Values": [events["ExecutionId"]]},
+                    {
+                        "Name": "instance-state-name",
+                        "Values": ["pending", "running", "stopping", "stopped"],
+                    },
+                ]
+            )["Reservations"]
+            ids = [i["InstanceId"] for r in reservations for i in r["Instances"]]
+            if ids:
+                ec2.terminate_instances(InstanceIds=ids)
+            return {"Terminated": ids}
+    outputs:
+      - Name: Terminated
+        Selector: $.Payload.Terminated
+        Type: StringList

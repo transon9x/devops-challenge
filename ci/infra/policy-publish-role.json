@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PushTheAppRepositoryOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:CompleteLayerUpload",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:<REGION>:<AWS_ACCOUNT_ID>:repository/<APP>"
+    },
+    {
+      "Sid": "RegistryToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "NeverDeleteOrRetag",
+      "Effect": "Deny",
+      "Action": [
+        "ecr:BatchDeleteImage",
+        "ecr:DeleteRepository",
+        "ecr:PutImageTagMutability",
+        "ecr:PutLifecyclePolicy",
+        "ecr:SetRepositoryPolicy"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

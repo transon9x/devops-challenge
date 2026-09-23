@@ -1,0 +1,333 @@
+---
+name: pipeline
+
+# The one workflow an application repository calls. It owns the stage graph:
+#   quality gate → build once (publish + sign on main) → [migrate dev] → deploy dev
+#   → [migrate prod] → deploy prod.
+# Application repositories only declare triggers and inputs; they never redefine stages.
+on:
+  workflow_call:
+    inputs:
+      app_dir:
+        type: string
+        default: '.'
+      stack:
+        type: string
+        default: node
+      node_version:
+        type: string
+        default: '24'
+      artifact_kind:
+        description: >-
+          image (backend container on EC2), bundle (backend runnable tree on EC2, no
+          container runtime) or static (frontend bundle → S3)
+        type: string
+        required: true
+      registry:
+        description: ghcr or ecr
+        type: string
+        required: true
+      image_name:
+        type: string
+        required: true
+      dockerfile:
+        type: string
+        default: Dockerfile
+      coverage_min:
+        type: string
+        default: '80'
+      fail_on:
+        type: string
+        default: high
+      sonar_project_key:
+        type: string
+        default: ''
+      aws_region:
+        type: string
+        default: ''
+      ecr_publish_role_arn:
+        type: string
+        default: ''
+      deploy:
+        description: Run the dev and prod deploy stages after a publish on main
+        type: boolean
+        default: true
+      migrate:
+        description: >-
+          Apply the release's database migrations as a gated job before each environment's
+          deploy. Requires `artifact_kind: bundle`, because the migrations travel inside the
+          bundle. Migrations must be expand-only: an authoring contract, checked in review
+          and flagged in the quality gate, not something this pipeline can prove.
+        type: boolean
+        default: false
+      release_sha:
+        description: Redeploy an already published release (workflow_dispatch); empty = this commit
+        type: string
+        default: ''
+      target_environment:
+        description: Redeploy target (workflow_dispatch); empty = dev then prod
+        type: string
+        default: ''
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+permissions: {}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      release_sha: ${{ steps.plan.outputs.release_sha }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+      deploy_dev: ${{ steps.plan.outputs.deploy_dev }}
+      deploy_prod: ${{ steps.plan.outputs.deploy_prod }}
+      migrate_dev: ${{ steps.plan.outputs.migrate_dev }}
+      migrate_prod: ${{ steps.plan.outputs.migrate_prod }}
+    steps:
+      - name: Decide what this run does
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          INPUT_SHA: ${{ inputs.release_sha }}
+          INPUT_ENV: ${{ inputs.target_environment }}
+          DEPLOY: ${{ inputs.deploy }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          KIND: ${{ inputs.artifact_kind }}
+          MIGRATE: ${{ inputs.migrate }}
+        run: |
+          set -euo pipefail
+          [[ "$KIND" =~ ^(image|bundle|static)$ ]] || { echo "::error::artifact_kind must be image, bundle or static"; exit 1; }
+          # The migration job applies migrations/*.sql out of the release bundle, so an
+          # image release cannot carry them: it publishes a companion bundle instead.
+          if [[ "$MIGRATE" == "true" && "$KIND" != "bundle" ]]; then
+            echo "::error::migrate: true needs artifact_kind: bundle" >&2
+            echo "::error::an image release publishes a companion migration bundle and calls this workflow for it" >&2
+            exit 1
+          fi
+          release_sha="${INPUT_SHA:-$HEAD_SHA}"
+          [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::release_sha must be a full lowercase commit SHA"; exit 1; }
+          [[ -z "$INPUT_ENV" || "$INPUT_ENV" =~ ^(dev|prod)$ ]] || { echo "::error::target_environment must be dev or prod"; exit 1; }
+          build=false publish=false env_dev=false env_prod=false
+          case "$EVENT" in
+            pull_request)
+              build=true ;;
+            push)
+              [[ "$REF" == "refs/heads/main" ]] || { echo "::error::the pipeline publishes from main only"; exit 1; }
+              build=true publish=true env_dev=true env_prod=true ;;
+            workflow_dispatch)
+              if [[ -n "$INPUT_SHA" ]]; then
+                [[ -n "$INPUT_ENV" ]] || { echo "::error::a redeploy needs target_environment"; exit 1; }
+              else
+                [[ "$DRY_RUN" != "true" ]] || { echo "::error::a dry run must name an already published release_sha; it never builds or publishes"; exit 1; }
+                [[ "$REF" == "refs/heads/main" ]] || { echo "::error::a new release must be dispatched from main"; exit 1; }
+                [[ "$INPUT_ENV" != "prod" ]] || { echo "::error::prod only promotes an already published release: pass release_sha"; exit 1; }
+                build=true publish=true
+              fi
+              case "$INPUT_ENV" in
+                dev) env_dev=true ;;
+                prod) env_prod=true ;;
+                '') env_dev=true env_prod=true ;;
+              esac ;;
+            *) echo "::error::unsupported event ${EVENT}"; exit 1 ;;
+          esac
+          # Deploying and migrating are gated separately, so `deploy: false, migrate: true`
+          # is a migration-only run — which is how an image fleet's companion migration
+          # bundle is applied.
+          deploy_dev=false deploy_prod=false migrate_dev=false migrate_prod=false
+          if [[ "$DEPLOY" == "true" ]]; then deploy_dev="$env_dev" deploy_prod="$env_prod"; fi
+          if [[ "$MIGRATE" == "true" ]]; then migrate_dev="$env_dev" migrate_prod="$env_prod"; fi
+          {
+            echo "release_sha=$release_sha"
+            echo "build=$build"
+            echo "publish=$publish"
+            echo "deploy_dev=$deploy_dev"
+            echo "deploy_prod=$deploy_prod"
+            echo "migrate_dev=$migrate_dev"
+            echo "migrate_prod=$migrate_prod"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Pipeline plan"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| event | \`${EVENT}\` |"
+            echo "| release | \`${release_sha}\` |"
+            echo "| build / publish | \`${build}\` / \`${publish}\` |"
+            echo "| deploy dev / prod | \`${deploy_dev}\` / \`${deploy_prod}\` |"
+            echo "| migrate dev / prod | \`${migrate_dev}\` / \`${migrate_prod}\` |"
+            echo "| dry run | \`${DRY_RUN}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  quality:
+    name: Quality gate
+    needs: plan
+    if: ${{ needs.plan.outputs.build == 'true' }}
+    permissions:
+      contents: read  # checkout
+    uses: $/.github/workflows/quality-gate.yml
+    with:
+      app_dir: ${{ inputs.app_dir }}
+      stack: ${{ inputs.stack }}
+      node_version: ${{ inputs.node_version }}
+      coverage_min: ${{ inputs.coverage_min }}
+      fail_on: ${{ inputs.fail_on }}
+      dockerfile: ${{ inputs.artifact_kind == 'image' && inputs.dockerfile || '' }}
+      sonar_project_key: ${{ inputs.sonar_project_key }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build:
+    name: Build once
+    needs: [plan, quality]
+    if: ${{ needs.plan.outputs.build == 'true' }}
+    permissions:
+      contents: read  # checkout
+      packages: write  # push artifact, signature and attestations
+      id-token: write  # keyless signing and OIDC to AWS
+      attestations: write  # GitHub provenance and SBOM attestations
+    uses: $/.github/workflows/build-publish.yml
+    with:
+      app_dir: ${{ inputs.app_dir }}
+      stack: ${{ inputs.stack }}
+      node_version: ${{ inputs.node_version }}
+      artifact_kind: ${{ inputs.artifact_kind }}
+      registry: ${{ inputs.registry }}
+      image_name: ${{ inputs.image_name }}
+      dockerfile: ${{ inputs.dockerfile }}
+      publish: ${{ needs.plan.outputs.publish == 'true' }}
+      fail_on: ${{ inputs.fail_on }}
+      aws_region: ${{ inputs.aws_region }}
+      ecr_publish_role_arn: ${{ inputs.ecr_publish_role_arn }}
+
+  dev-migrate:
+    name: dev schema
+    needs: [plan, build]
+    if: >-
+      !cancelled() && needs.plan.outputs.migrate_dev == 'true' &&
+      inputs.artifact_kind != 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    permissions:
+      contents: read  # checkout
+      packages: write  # the migration promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's migration role
+    uses: $/.github/workflows/migrate-db.yml
+    with:
+      environment: dev
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}
+
+  dev-ec2:
+    name: dev
+    needs: [plan, build, dev-migrate]
+    # `!cancelled()` disables the implicit success gate, so the migration result is
+    # required explicitly: success when migrations are enabled, any result when they are not.
+    if: >-
+      !cancelled() && needs.plan.outputs.deploy_dev == 'true' && inputs.artifact_kind != 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.dev-migrate.result == 'success' || !inputs.migrate)
+    permissions:
+      contents: read  # checkout
+      packages: write  # promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's deploy role
+    uses: $/.github/workflows/deploy-ec2.yml
+    with:
+      environment: dev
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}
+
+  dev-s3:
+    name: dev
+    needs: [plan, build]
+    if: >-
+      !cancelled() && needs.plan.outputs.deploy_dev == 'true' && inputs.artifact_kind == 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    permissions:
+      contents: read  # checkout
+      packages: write  # promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's deploy role
+    uses: $/.github/workflows/deploy-s3.yml
+    with:
+      environment: dev
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}
+
+  prod-migrate:
+    name: prod schema
+    needs: [plan, build, dev-migrate, dev-ec2]
+    if: >-
+      !cancelled() && needs.plan.outputs.migrate_prod == 'true' &&
+      inputs.artifact_kind != 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.dev-migrate.result == 'success' || needs.dev-migrate.result == 'skipped') &&
+      (needs.dev-ec2.result == 'success' || needs.dev-ec2.result == 'skipped')
+    permissions:
+      contents: read  # checkout
+      packages: write  # reads the dev migration attestation
+      id-token: write  # OIDC to the environment's migration role
+    uses: $/.github/workflows/migrate-db.yml
+    with:
+      environment: prod
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}
+
+  prod-ec2:
+    name: prod
+    needs: [plan, build, dev-ec2, prod-migrate]
+    if: >-
+      !cancelled() && needs.plan.outputs.deploy_prod == 'true' && inputs.artifact_kind != 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.dev-ec2.result == 'success' || needs.dev-ec2.result == 'skipped') &&
+      (needs.prod-migrate.result == 'success' || !inputs.migrate)
+    permissions:
+      contents: read  # checkout
+      packages: write  # promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's deploy role
+    uses: $/.github/workflows/deploy-ec2.yml
+    with:
+      environment: prod
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}
+
+  prod-s3:
+    name: prod
+    needs: [plan, build, dev-s3]
+    if: >-
+      !cancelled() && needs.plan.outputs.deploy_prod == 'true' && inputs.artifact_kind == 'static' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.dev-s3.result == 'success' || needs.dev-s3.result == 'skipped')
+    permissions:
+      contents: read  # checkout
+      packages: write  # promotion attestation is stored next to the artifact
+      id-token: write  # OIDC to the environment's deploy role
+    uses: $/.github/workflows/deploy-s3.yml
+    with:
+      environment: prod
+      artifact: ${{ inputs.image_name }}
+      digest: ${{ needs.build.outputs.digest }}
+      release_sha: ${{ needs.plan.outputs.release_sha }}
+      registry: ${{ inputs.registry }}
+      dry_run: ${{ inputs.dry_run }}

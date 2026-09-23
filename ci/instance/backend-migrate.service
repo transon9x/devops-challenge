@@ -1,0 +1,42 @@
+[Unit]
+Description=Apply the database migrations the pinned release carries, once, then shut down
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# A job, not a service: it runs once on an ephemeral host the runbook launches, publishes
+# its outcome to Parameter Store and powers the host off. It is never enabled on a serving
+# instance, and the pipeline has no path to the database of its own.
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=backend-migrate
+RuntimeDirectoryMode=0750
+StateDirectory=backend-migrate
+StateDirectoryMode=0750
+ExecStart=/opt/backend/migrate.sh
+TimeoutStartSec=1800
+
+User=migrator
+Group=migrator
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/opt/backend
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tar.gz
+.DS_Store
+coverage/
+.ci-templates/
+__pycache__/
+ci-out/
+.ruff_cache/

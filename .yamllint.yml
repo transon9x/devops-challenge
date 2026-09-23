@@ -1,0 +1,13 @@
+---
+extends: default
+
+rules:
+  line-length:
+    max: 160
+  comments-indentation: disable
+  truthy:
+    check-keys: false
+
+ignore: |
+  **/node_modules/
+  **/dist/

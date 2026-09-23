@@ -1,0 +1,142 @@
+flowchart TB
+    subgraph clients["Clients — global"]
+        web["Web / mobile SPA"]
+        trader["REST + WebSocket API clients"]
+        psp["Payment provider webhooks"]
+    end
+
+    subgraph edge["Edge — CloudFront is the only public surface"]
+        r53["Route 53<br/>alias to CloudFront · health checks"]
+        shield["Shield Advanced<br/>CloudFront · Route 53"]
+        cf["CloudFront — the only public surface<br/>SPA · 1–5 s public market-data cache · WebSocket pass-through<br/>adds viewer-location headers"]
+        wafcf["WAF — one web ACL<br/>managed · rate-based · geo-match · bot rules"]
+    end
+
+    subgraph regional["Regional services — outside the VPC"]
+        spa[("S3 — SPA bundle<br/>private · read by CloudFront through OAC")]
+        s3[("S3 — audit archive<br/>written by archive-svc through a VPC endpoint")]
+        beacon[("DynamoDB global table<br/>1 s commit beacon · replica in the standby region")]
+    end
+
+    subgraph vpc["VPC — 3 AZ, private subnets only"]
+        alb["internal ALB — CloudFront VPC origin<br/>/api/* /webhooks/* → Kong · /ws/* → market-data-gateway"]
+
+        subgraph eks["EKS trading-prod — Karpenter, m8i node pools"]
+            kong["Kong Gateway OSS — 3 replicas, own namespace + pool<br/>HMAC/JWT consumers · Valkey-backed quotas · Prometheus"]
+            subgraph nsauth["namespace team-auth"]
+                auth["auth-svc"]
+                loc["location-svc"]
+            end
+            subgraph nspay["namespace team-payments"]
+                pay["payment-svc"]
+                wallet["wallet-svc"]
+            end
+            subgraph nstrade["namespace team-trading"]
+                ordersvc["order-svc<br/>JSON-schema validation"]
+                mdgw["market-data-gateway"]
+                me["matching-svc — single writer<br/>advisory lock + epoch fence"]
+                relay["outbox-relay"]
+                recon["reconciliation-svc"]
+            end
+            subgraph nsrecs["namespace team-recs — GPU pool (g4dn)"]
+                recs["recommendation-price-svc<br/>features · inference · training"]
+            end
+            keda["KEDA — scale consumers on Kafka lag"]
+            archive["archive-svc"]
+            podid["Pod Identity agent<br/>every AWS call keyless"]
+        end
+
+        subgraph data["Data tier — private subnets, 3 AZ"]
+            proxy["RDS Proxy (reads)"]
+            aurora[("Aurora PostgreSQL<br/>orders · trades · ledger · events · inbound journal")]
+            valkey[("ElastiCache Valkey — separate replication groups<br/>book · sessions · features · quotas")]
+            msk["MSK provisioned<br/>market · orders · payments · auth · risk · recs"]
+        end
+    end
+
+    subgraph dr["Standby region — warm, fenced promotion"]
+        drstack["EKS: system pool + 2× Kong, market-data-gateway, order-svc<br/>matching-svc + outbox-relay deployed but quiescent until promotion bumps the epoch<br/>internal ALB pre-registered as a second VPC origin<br/>own Valkey groups + MSK fed by MSK Replicator"]
+        draurora[("Aurora Global Database secondary<br/>async: RPO = replication lag")]
+    end
+
+    subgraph obs["EKS obs-prod — one tenant per team"]
+        alloy["Alloy DaemonSets + YACE"]
+        mimir["Mimir"]
+        ch["ClickHouse — logs"]
+        tempo["Tempo"]
+        pyro["Pyroscope"]
+        graf["Grafana — one org per team"]
+        am["Mimir Alertmanager"]
+        pd["PagerDuty"]
+    end
+
+    web --> r53 --> cf
+    trader --> r53
+    psp --> r53
+    shield -.- cf
+    shield -.- r53
+    wafcf -.- cf
+
+    cf -- "origin access control" --> spa
+    cf -- "VPC origin" --> alb
+    alb -- "REST + webhooks" --> kong
+    alb -- "WebSocket" --> mdgw
+    kong --> auth
+    kong --> pay
+    kong --> ordersvc
+    kong --> recs
+    kong -. "quota counters" .-> valkey
+
+    ordersvc -- "place / cancel (idempotent)" --> me
+    me == "one ACID transaction:<br/>reserve → match → ledger → outbox" ==> aurora
+    me -. "ack after commit" .-> ordersvc
+    wallet ==> aurora
+    pay ==> aurora
+    relay -- "read events, publish in order" --> aurora
+    relay -- "the only producer of anything acknowledged" --> msk
+    loc -. "risk.signals — advisory, direct" .-> msk
+    recs -. "recs.prices — advisory, direct" .-> msk
+    msk --> mdgw
+    msk --> pay
+    msk --> loc
+    msk --> recs
+    msk --> archive --> s3
+    keda -.-> pay
+    keda -.-> loc
+    keda -.-> recs
+
+    auth --> proxy --> aurora
+    ordersvc --> valkey
+    mdgw --> valkey
+    recs --> valkey
+    recon --> aurora
+
+    eks -. "metrics · logs · traces · profiles" .-> alloy
+    alloy --> mimir
+    alloy --> ch
+    alloy --> tempo
+    alloy --> pyro
+    graf --> mimir
+    graf --> ch
+    graf --> tempo
+    graf --> pyro
+    mimir --> am --> pd
+
+    relay -. "every 1 s: highest committed seq + timestamp" .-> beacon
+    beacon -. "global table replica" .-> drstack
+    aurora -. "Global Database (async)" .-> draurora
+    msk -. "MSK Replicator: market topics" .-> drstack
+    cf -. "read-only GET/HEAD/OPTIONS origin group" .-> drstack
+    cf == "after fencing: promote, bump epoch, repoint /api/* and /ws/*" ==> drstack
+    draurora -. "promoted on regional loss" .-> drstack
+
+    classDef hot fill:#fde68a,stroke:#b45309,stroke-width:2px,color:#1f2937
+    classDef store fill:#dbeafe,stroke:#1d4ed8,color:#1f2937
+    classDef edgeStyle fill:#e9d5ff,stroke:#7e22ce,color:#1f2937
+    classDef obsStyle fill:#dcfce7,stroke:#15803d,color:#1f2937
+    class me,relay,ordersvc hot
+    class aurora,valkey,s3,msk,proxy,beacon store
+    class r53,cf,wafcf,shield,alb,kong,podid edgeStyle
+    class alloy,mimir,ch,tempo,pyro,graf,am,pd obsStyle
+    classDef drStyle fill:#fee2e2,stroke:#b91c1c,stroke-dasharray:4 3,color:#1f2937
+    class drstack,draurora drStyle

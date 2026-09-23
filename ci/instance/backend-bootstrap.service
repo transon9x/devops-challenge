@@ -1,0 +1,18 @@
+[Unit]
+Description=Verify, fetch and start the backend release pinned on this instance
+# Docker is required only by container fleets, so the dependency is not here: the image AMI
+# installs backend-bootstrap.service.d/10-docker.conf from this directory into
+# /etc/systemd/system/backend-bootstrap.service.d/, and the bundle AMI does not.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=backend
+RuntimeDirectoryMode=0750
+ExecStart=/opt/backend/bootstrap.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

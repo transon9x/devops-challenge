@@ -1,0 +1,13 @@
+[Unit]
+Description=Dead-man switch: power off the migration job host even if nothing else does
+# Enabled only in the migration AMI. The runbook terminates the host on the normal path;
+# this covers the paths where the runbook itself fails after the host has booted, so an
+# ephemeral host with database access can never be left running.
+
+[Timer]
+OnBootSec=45min
+AccuracySec=1min
+Unit=backend-migrate-guard.service
+
+[Install]
+WantedBy=timers.target
